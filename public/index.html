@@ -163,8 +163,8 @@
   #lb .stage{position:relative;overflow:hidden}
   /* 图片单独放在一个可滚动的“画布”里，导航按钮是它的兄弟节点，不会跟着内容滚 */
   #lb .canvas{position:absolute;inset:0;overflow:hidden;display:flex;align-items:center;
-    justify-content:center;padding:14px 60px}
-  #lb .canvas img,#lb .canvas video{max-width:100%;max-height:calc(100vh - 28px);
+    justify-content:center;padding:0}
+  #lb .canvas img,#lb .canvas video{max-width:100%;max-height:100%;
     object-fit:contain;border-radius:4px;transition:opacity .12s}
   /* 图片用 transform 缩放（不重排），画布本身不滚动 */
   #lb .canvas img{cursor:zoom-in;transition:transform .16s cubic-bezier(.22,.85,.3,1)}
@@ -1117,9 +1117,9 @@ function lbFitScale() {
   const v = lbView, c = lbCanvas(), stage = $('#lbStage');
   if (!v || !c || !stage) return 1;
   const fs = lbIsFullscreen();
-  // 全屏：按整个屏幕算，不留任何边距；窗口模式：左右各留 60px 给导航按钮
-  const availW = Math.max(80, stage.clientWidth - (fs ? 0 : 120));
-  const availH = Math.max(80, stage.clientHeight - (fs ? 0 : 28));
+  // 一律用整个舞台/屏幕，不给导航箭头预留 —— 箭头直接浮在图片上面
+  const availW = Math.max(80, stage.clientWidth);
+  const availH = Math.max(80, stage.clientHeight);
   const contain = Math.min(availW / v.nw, availH / v.nh, 1);
   if (fs && lbFillMode === 'fill') {
     return Math.min(1, Math.max(availW / v.nw, availH / v.nh));   // cover：铺满并裁掉溢出部分
