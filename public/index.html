@@ -936,7 +936,7 @@ async function openLightbox(i, opts = {}) {
   const canvasEl = $('#lbCanvas');
 
   // 图片 → 图片：先留着旧图（不黑屏），新图加载好再替换
-  const prevImg = (!isVideo && lbView && lbView.img && canvasEl && canvasEl.contains(lbView.img))
+  const prevImg = (lbView && lbView.img && canvasEl && canvasEl.contains(lbView.img))
     ? lbView.img : null;
   lbDropPending();
   if (!prevImg) clearStage();                 // 视频 / 第一张：清空画布
@@ -951,7 +951,12 @@ async function openLightbox(i, opts = {}) {
     v.setAttribute('tabindex', '-1');   // 别抢焦点，否则左右方向键会被视频拿去快进
     canvasEl.appendChild(v);
     v.blur();
-    const vDone = () => { lbSpinner(false); lbLoading = false; };
+    const vDone = () => {
+      lbSpinner(false);
+      lbLoading = false;
+      // 视频有画面之后再撤掉垫底的旧图
+      requestAnimationFrame(() => requestAnimationFrame(() => lbKeepOnly(null)));
+    };
     v.addEventListener('loadeddata', vDone, { once: true });
     v.addEventListener('error', vDone, { once: true });
   } else {
@@ -972,14 +977,21 @@ async function openLightbox(i, opts = {}) {
     img.style.visibility = 'hidden';   // 等 lbReset 把尺寸/缩放摆好再显形
     canvasEl.appendChild(img);
 
-    const finish = () => {
+    const finish = async () => {
       if (!img.naturalWidth) return;
       if (!canvasEl.contains(img)) return;      // 期间已被 clearStage 清掉，作废
-      lbKeepOnly(img);                 // 旧的 / 过期的图这时才移除
+      // Safari：load 事件只代表“数据到了”，位图可能还没解码完。
+      // 这时候如果先移除旧图，画布会露出底色（黑屏）。所以先等 decode()。
+      try { if (img.decode) await img.decode(); } catch {}
+      if (!canvasEl.contains(img)) return;
       img.removeAttribute('data-pending');
-      lbReset(img);
+      lbReset(img);                    // 新图先就位并显形（压在旧图上面）
       lbSpinner(false);
       lbLoading = false;
+      // 再等两帧确保新图真的画出来了，才把旧图移除 —— 彻底避免中间闪黑
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        if (canvasEl.contains(img)) lbKeepOnly(img);
+      }));
     };
     img.addEventListener('load', finish, { once: true });
     img.addEventListener('error', () => { lbSpinner(false); lbLoading = false; }, { once: true });
@@ -1149,7 +1161,10 @@ function lbDropPending() {
 function lbKeepOnly(keep) {
   const c = lbCanvas();
   if (!c) return;
-  c.querySelectorAll('img').forEach((i) => { if (i !== keep) i.remove(); });
+  // 只清理“已经用过”的旧图，别把刚发起、还在加载的新图一起删了
+  c.querySelectorAll('img').forEach((i) => {
+    if (i !== keep && i.dataset.pending !== '1') i.remove();
+  });
 }
 
 function lbImg() {
@@ -1544,8 +1559,9 @@ $('#lbForceFull').addEventListener('click', (e) => {
   // 换源期间也显示转圈，加载完重新贴合
   lbLoading = true;
   lbSpinner(true);
-  img.addEventListener('load', () => {
+  img.addEventListener('load', async () => {
     if (!img.naturalWidth) return;
+    try { if (img.decode) await img.decode(); } catch {}
     lbReset(img);
     lbSpinner(false);
     lbLoading = false;
