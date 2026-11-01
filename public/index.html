@@ -168,6 +168,14 @@
     object-fit:contain;border-radius:4px;transition:opacity .12s}
   /* 图片用 transform 缩放（不重排），画布本身不滚动 */
   #lb .canvas img{cursor:zoom-in;transition:transform .16s cubic-bezier(.22,.85,.3,1)}
+  /* 换图时旧图先留着（不黑屏），轻微变暗提示正在加载 */
+  #lb .canvas img.lb-stale{opacity:.45}
+  /* 加载中转圈 */
+  #lb .lgspin{position:absolute;left:50%;top:50%;width:34px;height:34px;margin:-17px 0 0 -17px;
+    border-radius:50%;border:3px solid rgba(255,255,255,.16);border-top-color:var(--accent);
+    animation:lbspin .8s linear infinite;display:none;pointer-events:none;z-index:7}
+  #lb .lgspin.show{display:block}
+  @keyframes lbspin{to{transform:rotate(360deg)}}
   #lb .stage.zoomed .canvas,#lb .stage.zoomed .canvas img{cursor:grab;user-select:none;-webkit-user-drag:none}
   #lb .stage.dragging .canvas,#lb .stage.dragging .canvas img{cursor:grabbing!important}
   /* 图片全屏：只渲染舞台本身（侧栏自然消失），画面占满 */
@@ -294,6 +302,7 @@
       <button id="lbFull" title="图片全屏（Esc 退出）">⛶ 全屏</button>
     </div>
     <div class="canvas" id="lbCanvas"></div>
+    <div class="lgspin" id="lbSpin"></div>
     <button class="nav prev" id="lbPrev">‹</button>
     <button class="nav next" id="lbNext">›</button>
   </div>
@@ -892,6 +901,8 @@ $('#grid').addEventListener('click', (e) => {
 function clearStage() {
   const stage = $('#lbStage');
   if (!stage) return;
+  lbSpinner(false);
+  lbLoading = false;
   stage.classList.remove('zoomed');
   stage.classList.remove('dragging');
   lbDrag = null;
@@ -922,16 +933,30 @@ async function openLightbox(i, opts = {}) {
   const isVideo = g.kinds.includes('video') && !g.kinds.some((k) => k === 'raw' || k === 'jpg' || k === 'heif');
   const p = g.preview;
   const stage = $('#lbStage');
-  clearStage();
+  const canvasEl = $('#lbCanvas');
+
+  // 图片 → 图片：先留着旧图（不黑屏），新图加载好再替换
+  const prevImg = (!isVideo && lbView && lbView.img && canvasEl && canvasEl.contains(lbView.img))
+    ? lbView.img : null;
+  lbDropPending();
+  if (!prevImg) clearStage();                 // 视频 / 第一张：清空画布
+  if (prevImg) prevImg.classList.add('lb-stale');
+  lbLoading = true;
+  lbSpinner(true);
+
   if (isVideo) {
     const v = document.createElement('video');
     v.src = '/api/media?rel=' + enc(g.videos[0]);
     v.controls = true; v.autoplay = true; v.playsInline = true;
     v.setAttribute('tabindex', '-1');   // 别抢焦点，否则左右方向键会被视频拿去快进
-    $('#lbCanvas').appendChild(v);
+    canvasEl.appendChild(v);
     v.blur();
+    const vDone = () => { lbSpinner(false); lbLoading = false; };
+    v.addEventListener('loadeddata', vDone, { once: true });
+    v.addEventListener('error', vDone, { once: true });
   } else {
     const img = document.createElement('img');
+    img.dataset.pending = '1';
     const jpg = g.items.find((x) => x.kind === 'jpg');
     const heif = g.items.find((x) => x.kind === 'heif');
     // 有 JPG 就用原图；只有 RAW / HEIF 时用服务端预览（浏览器不能解码）
@@ -945,9 +970,20 @@ async function openLightbox(i, opts = {}) {
       img.src = '/api/media?rel=' + enc(p.rel);
     }
     img.style.visibility = 'hidden';   // 等 lbReset 把尺寸/缩放摆好再显形
-    $('#lbCanvas').appendChild(img);
-    img.addEventListener('load', () => lbReset(img));
-    if (img.complete && img.naturalWidth) lbReset(img);
+    canvasEl.appendChild(img);
+
+    const finish = () => {
+      if (!img.naturalWidth) return;
+      if (!canvasEl.contains(img)) return;      // 期间已被 clearStage 清掉，作废
+      lbKeepOnly(img);                 // 旧的 / 过期的图这时才移除
+      img.removeAttribute('data-pending');
+      lbReset(img);
+      lbSpinner(false);
+      lbLoading = false;
+    };
+    img.addEventListener('load', finish, { once: true });
+    img.addEventListener('error', () => { lbSpinner(false); lbLoading = false; }, { once: true });
+    if (img.complete && img.naturalWidth) finish();
     // 加载完成后把真实像素尺寸显示出来，方便确认当前看的是原图还是预览
     img.addEventListener('load', () => {
       const nt = $('#qualityNote');
@@ -1102,6 +1138,20 @@ let lbLastDragAt = 0;    // 上一次真实拖拽结束的时间
 const lbJustDragged = () => Date.now() - lbLastDragAt < 350;
 let lbApplyQueued = false;
 
+let lbLoading = false;
+function lbSpinner(on) { const el = $('#lbSpin'); if (el) el.classList.toggle('show', !!on); }
+/** 清掉所有“还没加载完”的待换图片 */
+function lbDropPending() {
+  const c = lbCanvas();
+  if (c) c.querySelectorAll('img[data-pending="1"]').forEach((i) => i.remove());
+}
+/** 只保留 keep 这一张图 */
+function lbKeepOnly(keep) {
+  const c = lbCanvas();
+  if (!c) return;
+  c.querySelectorAll('img').forEach((i) => { if (i !== keep) i.remove(); });
+}
+
 function lbImg() {
   const c = $('#lbCanvas');
   return c ? c.querySelector('img') : null;
@@ -1230,6 +1280,7 @@ function lbReset(img) {
 let lbDrag = null;
 
 $('#lbStage').addEventListener('pointerdown', (e) => {
+  if (lbLoading) return;
   const v = lbView;
   if (!v || e.button !== 0) return;
   if (e.target.closest('button')) return;            // 别拦上一张/下一张/全屏按钮
@@ -1267,6 +1318,7 @@ $('#lbStage').addEventListener('dragstart', (e) => e.preventDefault());
 
 // ---------------- 滚轮 / 触控板捏合 ----------------
 $('#lbStage').addEventListener('wheel', (e) => {
+  if (lbLoading) return;
   const v = lbView;
   if (!v || e.target.closest('img') !== v.img) return;
   const c = lbCanvas().getBoundingClientRect();
@@ -1328,6 +1380,7 @@ $('#lbStage').addEventListener('gestureend', (e) => { e.preventDefault(); lbGest
 let lbZoomedBeforeDbl = false;   // 双击序列开始前是不是放大状态
 
 $('#lbStage').addEventListener('click', (e) => {
+  if (lbLoading) return;
   if (lbJustDragged()) return;
   if (e.target.closest('button')) return;
   const v = lbView;
@@ -1351,6 +1404,7 @@ $('#lbStage').addEventListener('click', (e) => {
 
 // 双击：放大状态下关闭大图
 $('#lbStage').addEventListener('dblclick', (e) => {
+  if (lbLoading) return;
   if (e.target.closest('button')) return;
   if (!lbZoomedBeforeDbl) return;      // 在适应屏幕时双击 = 只是放大，不关闭
   e.preventDefault();
@@ -1365,6 +1419,7 @@ function touchDist(t) {
 }
 
 $('#lbStage').addEventListener('touchstart', (e) => {
+  if (lbLoading) return;
   const v = lbView;
   if (!v || e.target.closest('img') !== v.img) return;
   const c = lbCanvas().getBoundingClientRect();
@@ -1486,6 +1541,16 @@ $('#lbForceFull').addEventListener('click', (e) => {
   e.target.style.display = 'none';
   const nt = $('#qualityNote');
   if (nt) nt.textContent = '原图加载中…（仅本张）';
+  // 换源期间也显示转圈，加载完重新贴合
+  lbLoading = true;
+  lbSpinner(true);
+  img.addEventListener('load', () => {
+    if (!img.naturalWidth) return;
+    lbReset(img);
+    lbSpinner(false);
+    lbLoading = false;
+  }, { once: true });
+  img.addEventListener('error', () => { lbSpinner(false); lbLoading = false; }, { once: true });
   img.src = '/api/media?rel=' + enc(jpg.rel);
 });
 $('#lbClose').addEventListener('click', () => closeLightbox());
