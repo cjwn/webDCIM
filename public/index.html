@@ -943,6 +943,7 @@ async function openLightbox(i, opts = {}) {
     } else {
       img.src = '/api/media?rel=' + enc(p.rel);
     }
+    img.style.visibility = 'hidden';   // 等 lbReset 把尺寸/缩放摆好再显形
     $('#lbCanvas').appendChild(img);
     img.addEventListener('load', () => lbReset(img));
     if (img.complete && img.naturalWidth) lbReset(img);
@@ -1130,6 +1131,22 @@ function lbApply() {
   v.img.style.transform = `translate3d(${v.tx}px, ${v.ty}px, 0) scale(${v.scale})`;
 }
 
+/**
+ * 瞬时应用（不带动画）。
+ * 进入全屏、窗口缩放、换图、图片加载 —— 这些是“布局变化”，绝不能有过渡，
+ * 否则会看到「先铺满全屏、再缩回一点」这种跳变。
+ * 只有用户点击缩放的那一次才走 CSS 过渡。
+ */
+function lbApplyInstant(fn) {
+  const img = lbView && lbView.img;
+  if (!img) { fn(); return; }
+  img.style.transition = 'none';
+  fn();
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (lbView && lbView.img === img) img.style.transition = '';
+  }));
+}
+
 /** 同一帧内多次缩放只应用一次，避免抖动 */
 function lbScheduleApply() {
   if (lbApplyQueued) return;
@@ -1178,11 +1195,15 @@ function lbReset(img) {
   img.style.transformOrigin = '0 0';
   img.style.willChange = 'transform';
   img.style.touchAction = 'none';
-  img.style.transition = '';
+  img.style.transition = 'none';
   lbView = { img, nw: img.naturalWidth, nh: img.naturalHeight, scale: 1, tx: 0, ty: 0, atFit: true };
   lbView.scale = lbFitScale();
   lbClamp();
   lbApply();
+  img.style.visibility = '';      // 尺寸就位后再显形，避免闪一下再缩
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (lbView && lbView.img === img) img.style.transition = '';
+  }));
   $('#lbStage').classList.toggle('zoomed', false);
 }
 
@@ -1375,11 +1396,13 @@ $('#lbStage').addEventListener('touchend', (e) => {
 // 不能只依赖 fullscreenchange —— 否则会先按旧尺寸显示一帧，再跳到新尺寸
 function lbRefitIfFit() {
   if (!lbView) return;
-  const fit = lbFitScale();
-  if (lbView.atFit) lbView.scale = fit;
-  else if (lbView.scale < fit) lbView.scale = fit;   // 尺寸变大后别比 fit 还小
-  lbClamp();
-  lbApply();
+  lbApplyInstant(() => {
+    const fit = lbFitScale();
+    if (lbView.atFit) lbView.scale = fit;
+    else if (lbView.scale < fit) lbView.scale = fit;   // 尺寸变大后别比 fit 还小
+    lbClamp();
+    lbApply();
+  });
 }
 window.addEventListener('resize', () => {
   if ($('#lb').classList.contains('show')) lbRefitIfFit();
