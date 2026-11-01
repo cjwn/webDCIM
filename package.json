@@ -1,0 +1,17 @@
+{
+  "name": "output-web-viewer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "E:OUTPUT 照片库本地/局域网浏览",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "open-lan": "powershell -NoProfile -ExecutionPolicy Bypass -File open-lan.ps1",
+    "oled": "node oled.js",
+    "oled-test": "node oled.js --dry-run"
+  },
+  "optionalDependencies": {
+    "sharp": "^0.33.0",
+    "serialport": "^12.0.0"
+  }
+}

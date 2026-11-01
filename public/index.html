@@ -1,0 +1,1465 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>照片库总览 · OUTPUT</title>
+<style>
+  :root{
+    --bg:#0d1016; --bg2:#141922; --bg3:#1b212c; --line:#252d3a;
+    --fg:#e6eaf2; --fg2:#9aa5b8; --fg3:#69758a;
+    --accent:#4d9fff; --accent2:#38d39f; --warn:#ffb454; --danger:#ff6b6b;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);
+    font:14px/1.5 "Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+  /* 缩略图尺寸档位：小 / 中 / 大 / 特大 */
+  :root{--cover:60px;--card:158px;--cardgap:8px;--fcard:200px}
+  body.sz-s{--cover:38px;--card:104px;--cardgap:6px;--fcard:150px}
+  body.sz-m{--cover:60px;--card:158px;--cardgap:8px;--fcard:180px}
+  body.sz-l{--cover:120px;--card:240px;--cardgap:10px;--fcard:200px}
+  body.sz-xl{--cover:220px;--card:340px;--cardgap:12px;--fcard:280px}
+  a{color:var(--accent);text-decoration:none}
+  button{font:inherit;color:inherit;background:var(--bg3);border:1px solid var(--line);
+    border-radius:7px;padding:6px 12px;cursor:pointer;transition:.15s}
+  button:hover{background:#242c3a;border-color:#334054}
+  button.active{background:var(--accent);border-color:var(--accent);color:#08111f;font-weight:600}
+  .mono{font-variant-numeric:tabular-nums;font-feature-settings:"tnum"}
+
+  /* ---------- header ---------- */
+  header{position:sticky;top:0;z-index:50;background:rgba(13,16,22,.92);
+    backdrop-filter:blur(10px);border-bottom:1px solid var(--line);padding:14px 22px}
+  .hrow{display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+  h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.3px}
+  h1 .ico{margin-right:6px}
+  .root{color:var(--fg3);font-size:12px;font-family:Consolas,monospace}
+  .lan{color:var(--accent2);font-size:12px;font-family:Consolas,monospace;cursor:pointer;
+    border:1px dashed rgba(56,211,159,.35);border-radius:6px;padding:1px 7px;opacity:.85}
+  .lan:hover{opacity:1;border-color:var(--accent2)}
+  .stats{display:flex;gap:16px;margin-left:auto;flex-wrap:wrap}
+  .stat{text-align:right}
+  .stat b{display:block;font-size:16px;font-weight:650}
+  .stat span{font-size:11px;color:var(--fg3)}
+  .bar{height:3px;background:var(--bg3);border-radius:3px;margin-top:10px;overflow:hidden}
+  .bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));
+    transition:width .3s;border-radius:3px}
+  .scanning{font-size:12px;color:var(--fg2);margin-top:6px;display:flex;gap:8px;align-items:center}
+  .dot{width:6px;height:6px;border-radius:50%;background:var(--accent);
+    animation:pulse 1s infinite;flex:none}
+  @keyframes pulse{50%{opacity:.25}}
+
+  /* ---------- toolbar ---------- */
+  .toolbar{display:flex;gap:8px;align-items:center;padding:12px 22px;flex-wrap:wrap;
+    position:sticky;top:0;z-index:40;background:var(--bg)}
+  .toolbar input[type=search]{background:var(--bg2);border:1px solid var(--line);color:var(--fg);
+    border-radius:7px;padding:6px 11px;min-width:190px;outline:none}
+  .toolbar input[type=search]:focus{border-color:var(--accent)}
+  .seg{display:flex;gap:0;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+  .seg button{border:0;border-radius:0;background:transparent;padding:6px 11px;color:var(--fg2)}
+  .seg button.active{background:var(--accent);color:#08111f}
+
+  /* ---------- overview ---------- */
+  main{padding:0 22px 60px}
+  .year{margin:22px 0 0}
+  .year-h{display:flex;align-items:baseline;gap:12px;padding:8px 2px;border-bottom:1px solid var(--line);
+    cursor:pointer;user-select:none}
+  .year-h h2{font-size:15px;margin:0;font-weight:650}
+  .year-h .sum{color:var(--fg3);font-size:12px;margin-left:auto}
+  .year-h .chev{color:var(--fg3);font-size:11px;transition:.2s}
+  .year.collapsed .chev{transform:rotate(-90deg)}
+  .year.collapsed .rows{display:none}
+
+  .rows{display:flex;flex-direction:column}
+
+  /* 大尺寸档位：总览表格 → 卡片墙 */
+  body.sz-l .rows, body.sz-xl .rows{
+    display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--fcard),1fr));
+    gap:14px;padding:14px 0 6px}
+  body.sz-l .row, body.sz-xl .row{
+    display:flex;flex-direction:column;align-items:stretch;gap:5px;
+    border:1px solid var(--line);border-radius:11px;padding:8px;background:var(--bg2);
+    border-bottom:1px solid var(--line)}
+  body.sz-l .row:hover, body.sz-xl .row:hover{background:var(--bg3);border-color:#3a475d}
+  body.sz-l .row .cover, body.sz-xl .row .cover{width:100%;height:var(--fcard);border-radius:8px}
+  body.sz-l .row .num, body.sz-xl .row .num{display:none}
+  body.sz-l .row .open, body.sz-xl .row .open{align-self:flex-end;margin-top:2px}
+  body.sz-l .row .name, body.sz-xl .row .name{font-size:15px}
+  body.sz-l .cover.ph b, body.sz-xl .cover.ph b{font-size:20px}
+  body.sz-l .cover.ph, body.sz-xl .cover.ph{font-size:12px}
+  .row{display:grid;grid-template-columns:var(--cover) 120px minmax(160px,1.05fr) 92px 92px minmax(150px,1.15fr) 118px 76px;
+    gap:12px;align-items:center;padding:7px 10px;border-radius:9px;cursor:pointer;
+    border-bottom:1px solid rgba(37,45,58,.5)}
+  .row:hover{background:var(--bg2)}
+  .row .cover{width:var(--cover);height:var(--cover);border-radius:7px;object-fit:cover;background:var(--bg3);display:block}
+  .cover.ph{display:flex;flex-direction:column;align-items:center;justify-content:center;
+    font-size:9.5px;line-height:1.15;color:var(--fg3);font-variant-numeric:tabular-nums;
+    border:1px solid var(--line)}
+  .cover.ph b{font-size:11px;color:var(--fg2);font-weight:600}
+  .card.ph{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;
+    color:var(--fg3);background:var(--bg2);border:1px solid var(--line);text-align:center;padding:6px}
+  .card.ph .e{font-size:12px;font-weight:700;letter-spacing:.5px;color:#8fa4c4}
+  .card.ph .n{font-size:10px;word-break:break-all;line-height:1.25;color:var(--fg2)}
+  .card.ph .s{font-size:10px;color:var(--fg3)}
+  .card.ph:hover .e{color:var(--accent)}
+  body.sz-l .card.ph .e{font-size:15px}
+  body.sz-l .card.ph .n{font-size:12px}
+  body.sz-l .card.ph .s{font-size:11px}
+  body.sz-s .card.ph .n{font-size:9px}
+  .row .name{font-weight:600;letter-spacing:.3px}
+  .row .name small{display:block;font-weight:400;color:var(--fg3);font-size:11px;letter-spacing:0}
+  .size{display:flex;flex-direction:column;gap:4px}
+  .size b{font-weight:650;font-variant-numeric:tabular-nums}
+  .size .minibar{height:4px;background:var(--bg3);border-radius:3px;overflow:hidden}
+  .size .minibar i{display:block;height:100%;border-radius:3px;background:var(--accent)}
+  .num{font-variant-numeric:tabular-nums;color:var(--fg2)}
+  .badges{display:flex;gap:4px;flex-wrap:wrap}
+  .badge{font-size:10.5px;padding:1.5px 6px;border-radius:5px;background:var(--bg3);
+    color:var(--fg2);border:1px solid var(--line);white-space:nowrap;font-variant-numeric:tabular-nums}
+  .badge.raw{color:#ffcf8a;border-color:#4a3a22;background:#2a2114}
+  .badge.jpg{color:#9fd8ff;border-color:#1e3a52;background:#132433}
+  .badge.video{color:#c7a4ff;border-color:#372a52;background:#221a33}
+  .badge.other{color:var(--fg3)}
+  .cam{color:var(--fg2);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .cam small{color:var(--fg3);display:block;font-size:11px}
+  .open{justify-self:end;padding:4px 9px;font-size:12px;color:var(--fg3);background:transparent;border-color:transparent}
+  .row:hover .open{color:var(--fg2);border-color:var(--line)}
+
+  /* ---------- detail ---------- */
+  #detail{position:fixed;inset:0;background:var(--bg);z-index:80;overflow:auto;display:none}
+  #detail.show{display:block}
+  .dhead{position:sticky;top:0;background:rgba(13,16,22,.94);backdrop-filter:blur(10px);
+    border-bottom:1px solid var(--line);padding:12px 22px;z-index:10}
+  .dhead .top{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .dhead h2{margin:0;font-size:17px}
+  .dmeta{color:var(--fg2);font-size:12.5px;display:flex;gap:14px;flex-wrap:wrap;margin-top:6px}
+  .dmeta b{color:var(--fg);font-weight:600}
+  .dbody{padding:16px 22px 70px}
+  .subs{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:8px;margin-bottom:18px}
+  .sub{background:var(--bg2);border:1px solid var(--line);border-radius:9px;padding:9px 12px;
+    display:flex;justify-content:space-between;gap:8px;align-items:center}
+  .sub .n{font-size:12.5px}
+  .sub .s{font-variant-numeric:tabular-nums;font-weight:600;font-size:12.5px}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--card),1fr));gap:var(--cardgap,8px)}
+  .card{position:relative;background:var(--bg2);border-radius:9px;overflow:hidden;
+    cursor:pointer;aspect-ratio:1;border:1px solid transparent}
+  .card:hover{border-color:var(--accent)}
+  .card img,.card video{width:100%;height:100%;object-fit:cover;display:block;background:var(--bg3)}
+  .card .tag{position:absolute;left:5px;bottom:5px;display:flex;gap:3px;pointer-events:none}
+  .card .tag span{font-size:9.5px;padding:1px 5px;border-radius:4px;
+    background:rgba(8,12,18,.82);color:#dfe6f2;letter-spacing:.4px}
+  .card .tag .r{color:#ffcf8a}
+  .card .tag .v{color:#c7a4ff}
+  .card:hover .tag{opacity:1}
+  .card.loading{background:linear-gradient(110deg,#141922,#1b212c,#141922);background-size:200% 100%;
+    animation:sh 1.2s linear infinite}
+  @keyframes sh{to{background-position:-200% 0}}
+  .empty{color:var(--fg3);padding:40px 0;text-align:center;font-size:13px}
+
+  /* ---------- lightbox ---------- */
+  #lb{position:fixed;inset:0;background:rgba(6,8,12,.96);z-index:200;display:none;
+    grid-template-columns:1fr 300px}
+  #lb.show{display:grid}
+  #lb .stage{position:relative;overflow:hidden}
+  /* 图片单独放在一个可滚动的“画布”里，导航按钮是它的兄弟节点，不会跟着内容滚 */
+  #lb .canvas{position:absolute;inset:0;overflow:hidden;display:flex;align-items:center;
+    justify-content:center;padding:14px 60px}
+  #lb .canvas img,#lb .canvas video{max-width:100%;max-height:calc(100vh - 28px);
+    object-fit:contain;border-radius:4px;transition:opacity .12s}
+  /* 图片用 transform 缩放（不重排），画布本身不滚动 */
+  #lb .canvas img{cursor:zoom-in;transition:transform .16s cubic-bezier(.22,.85,.3,1)}
+  #lb .stage.zoomed .canvas,#lb .stage.zoomed .canvas img{cursor:grab;user-select:none;-webkit-user-drag:none}
+  #lb .stage.dragging .canvas,#lb .stage.dragging .canvas img{cursor:grabbing!important}
+  /* 图片全屏：只渲染舞台本身（侧栏自然消失），画面占满 */
+  #lb .stage:fullscreen{background:#000}
+  #lb .stage:fullscreen .canvas{padding:0}
+  #lb .stage:fullscreen .canvas img,#lb .stage:fullscreen .canvas video{max-height:100vh;max-width:100vw;
+    border-radius:0;object-fit:contain}
+  .stagebtns{position:absolute;top:10px;right:10px;display:flex;gap:6px;z-index:6;opacity:.5;
+    transition:opacity .15s}
+  #lb .stage:hover .stagebtns{opacity:1}
+  .stagebtns button{padding:5px 10px;font-size:12px;background:rgba(20,25,34,.8);
+    border:1px solid rgba(80,92,112,.6);border-radius:8px;backdrop-filter:blur(4px)}
+  #lb .side{background:var(--bg2);border-left:1px solid var(--line);padding:18px;overflow:auto}
+  #lb .side h3{margin:0 0 4px;font-size:13px;word-break:break-all;line-height:1.4}
+  #lb .side .kv{display:grid;grid-template-columns:64px 1fr;gap:6px 10px;font-size:12.5px;
+    margin-top:16px;color:var(--fg2)}
+  #lb .side .kv b{color:var(--fg3);font-weight:400}
+  #lb .side .kv span{color:var(--fg);word-break:break-all}
+  #lb .nav{position:absolute;top:50%;transform:translateY(-50%);width:46px;height:72px;
+    background:rgba(20,25,34,.55);border:1px solid rgba(80,92,112,.55);font-size:22px;color:var(--fg2);
+    display:flex;align-items:center;justify-content:center;border-radius:10px;
+    backdrop-filter:blur(4px);opacity:.55;transition:opacity .15s,background .15s}
+  #lb .stage:hover .nav{opacity:1}
+  #lb .nav:hover{color:#fff;background:rgba(30,38,50,.92);border-color:var(--accent)}
+  /* 按钮贴在舞台两侧，不再侵占画面 */
+  #lb .prev{left:10px}#lb .next{right:10px}
+  /* 窄屏时缩小，避免遮挡 */
+  @media (max-width: 1100px){ #lb .nav{width:38px;height:56px;font-size:18px} }
+  .lbclose{position:static;float:right;z-index:5}
+
+  .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(80px);
+    background:#1e2631;border:1px solid var(--line);padding:9px 16px;border-radius:9px;
+    font-size:13px;opacity:0;transition:.25s;z-index:300;pointer-events:none}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  ::-webkit-scrollbar{width:11px;height:11px}
+  ::-webkit-scrollbar-thumb{background:#2a3342;border-radius:6px;border:3px solid var(--bg)}
+  ::-webkit-scrollbar-thumb:hover{background:#38445a}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="hrow">
+    <h1><span class="ico">📷</span>照片库总览</h1>
+    <span class="root" id="rootPath"></span>
+    <span class="lan" id="lanUrl" style="display:none" title="点击复制，手机/别的电脑用这个地址"></span>
+    <div class="stats">
+      <div class="stat"><b class="mono" id="tFolders">–</b><span>文件夹</span></div>
+      <div class="stat"><b class="mono" id="tFiles">–</b><span>文件</span></div>
+      <div class="stat"><b class="mono" id="tSize">–</b><span>总大小</span></div>
+      <div class="stat"><b class="mono" id="tTime">–</b><span>&nbsp;</span></div>
+    </div>
+  </div>
+  <div class="bar" id="progBar" style="display:none"><i style="width:0%"></i></div>
+  <div class="scanning" id="scanLine" style="display:none"><span class="dot"></span><span id="scanText"></span></div>
+</header>
+
+<div class="toolbar">
+  <input type="search" id="q" placeholder="搜索文件夹 / 年份 / 相机…">
+  <div class="seg" id="sortSeg">
+    <button data-sort="date" class="active">日期 ↓</button>
+    <button data-sort="dateUp">日期 ↑</button>
+    <button data-sort="size">大小 ↓</button>
+    <button data-sort="files">张数 ↓</button>
+  </div>
+  <div class="seg" id="thumbSeg">
+    <button data-t="off" class="active" title="不加载任何图片，最快">缩略图 关</button>
+    <button data-t="auto" title="只加载屏幕上可见的缩略图">缩略图 自动</button>
+  </div>
+  <div class="seg" id="sizeSeg">
+    <button data-s="s" title="小">小</button>
+    <button data-s="m" title="中">中</button>
+    <button data-s="l" class="active" title="大：总览变卡片墙">大</button>
+    <button data-s="xl" title="特大">特大</button>
+  </div>
+  <button id="btnRescan" title="重新扫描磁盘">↻ 重新扫描</button>
+  <button id="btnCache" title="查看 / 清空缩略图缓存">🧹 缓存</button>
+  <span style="color:var(--fg3);font-size:12px" id="hintText"></span>
+</div>
+
+<main id="overview"></main>
+
+<div id="detail">
+  <div class="dhead">
+    <div class="top">
+      <button id="btnBack">← 返回总览</button>
+      <h2 id="dTitle"></h2>
+      <span style="margin-left:auto;display:flex;gap:8px">
+        <button id="btnOpenFolder">📂 在资源管理器中打开</button>
+      </span>
+    </div>
+    <div class="dmeta" id="dMeta"></div>
+  </div>
+  <div class="dbody">
+    <div id="dSubs" class="subs"></div>
+    <div class="toolbar" style="padding:0 0 12px;position:static;background:transparent">
+      <div class="seg" id="filterSeg">
+        <button data-f="all" class="active">全部</button>
+        <button data-f="photo">照片</button>
+        <button data-f="raw">RAW</button>
+        <button data-f="video">视频</button>
+        <button data-f="other">其它</button>
+      </div>
+      <div class="seg" id="thumbSeg2">
+        <button data-t="off" class="active">缩略图 关</button>
+        <button data-t="auto">缩略图 自动</button>
+      </div>
+      <div class="seg" id="sizeSeg2">
+        <button data-s="s">小</button>
+        <button data-s="m">中</button>
+        <button data-s="l" class="active">大</button>
+        <button data-s="xl">特大</button>
+      </div>
+      <span style="color:var(--fg3);font-size:12px" id="gridHint"></span>
+    </div>
+    <div class="grid" id="grid"></div>
+  </div>
+</div>
+
+<div id="lb">
+  <div class="stage" id="lbStage">
+    <div class="stagebtns">
+      <button id="lbFull" title="图片全屏（Esc 退出）">⛶ 全屏</button>
+    </div>
+    <div class="canvas" id="lbCanvas"></div>
+    <button class="nav prev" id="lbPrev">‹</button>
+    <button class="nav next" id="lbNext">›</button>
+  </div>
+  <div class="side">
+    <button class="lbclose" id="lbClose" style="position:static;float:right">✕</button>
+    <h3 id="lbName"></h3>
+    <div class="kv" id="lbInfo"></div>
+    <div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
+      <button id="lbOpen">📂 定位文件</button>
+      <a id="lbDownload" download><button>⬇ 下载原图</button></a>
+      <a id="lbDownloadRaw" download style="display:none"><button>⬇ 下载 RAW</button></a>
+      <button id="lbForceFull" style="display:none" title="只这张看原图，不影响后面的浏览速度">🔍 本张看原图</button>
+    </div>
+    <div class="seg" id="qualitySeg" style="margin-top:14px">
+      <button data-q="preview">高清预览 2048</button>
+      <button data-q="full">原图</button>
+    </div>
+    <div id="qualityNote" style="margin-top:6px;color:var(--fg3);font-size:11px"></div>
+    <div style="margin-top:18px;color:var(--fg3);font-size:11.5px;line-height:1.9">
+      ← → 上一张 / 下一张<br>
+      单击 放大/缩小 ・ 双击 关闭 ・ 滚轮/双指缩放<br>
+      Esc 关闭　　后退键 返回网格
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+'use strict';
+// ---------------------------------------------------------------- 工具
+const $ = (s) => document.querySelector(s);
+const fmtSize = (b) => {
+  if (!b) return '0 B';
+  const u = ['B','KiB','MiB','GiB','TiB'];
+  let i = 0, v = b;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(v >= 100 ? 0 : 1)) + ' ' + u[i];
+};
+const fmtNum = (n) => (n || 0).toLocaleString('en-US');
+const enc = encodeURIComponent;
+const KIND_LABEL = { raw: 'RAW', jpg: 'JPG', video: '视频', heif: 'HEIF', other: '其它' };
+const kindClass = (k) => k === 'raw' ? 'raw' : k === 'video' ? 'video' : k === 'jpg' ? 'jpg' : k === 'heif' ? 'jpg' : 'other';
+const extKind = (name) => {
+  const e = (name.match(/\.[a-z0-9]+$/i) || [''])[0].toLowerCase();
+  if (['.rw2','.cr3','.cr2','.arw','.orf','.nef','.dng','.raf','.rwl','.pef','.srw','.raw'].includes(e)) return 'raw';
+  if (['.jpg','.jpeg','.png','.webp','.gif','.bmp','.tif','.tiff','.avif'].includes(e)) return 'jpg';
+  if (['.hif','.heic','.heif'].includes(e)) return 'heif';
+  if (['.mov','.mp4','.avi','.m4v','.mkv','.mts','.m2ts','.3gp','.wmv'].includes(e)) return 'video';
+  return 'other';
+};
+function toast(msg) {
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 1800);
+}
+
+// ---------------------------------------------------------------- 状态
+let STATE = { folders: [], totals: {}, status: 'idle', progress: {} };
+let sortKey = 'date', collapsedYears = new Set(), filter = 'all';
+let currentFolder = null, currentFiles = [], lbIndex = -1;
+let gridIO = null;              // 网格的懒加载观察器
+let gridWant = new Set();       // 当前想看（在视口附近）的卡片
+let gridActive = new Set();     // 正在下载的卡片
+const GRID_CONCURRENCY = 6;     // 浏览器每域默认也是 6，再多也没用
+let thumbWorkPaused = false;    // 是否因为播视频而暂停了缩略图生成
+let pauseHeartbeat = null;      // 播视频期间给服务端续期（服务端暂停只保留 30s）
+let pendingNav = parseNav();
+function parseNav() {
+  const raw = location.hash.replace(/^#/, '');
+  if (!raw) return { folder: null, photo: null };
+  const q = new URLSearchParams(raw);
+  return { folder: q.get('folder'), photo: q.get('p') };
+}
+const hashFor = (folder, photo) => '#folder=' + enc(folder) + (photo ? '&p=' + enc(photo) : '');
+let thumbMode = localStorage.getItem('thumbMode') || 'off';   // off | auto
+
+function setThumbMode(m) {
+  thumbMode = m;
+  localStorage.setItem('thumbMode', m);
+  for (const id of ['#thumbSeg', '#thumbSeg2']) {
+    const seg = $(id); if (!seg) continue;
+    [...seg.children].forEach((b) => b.classList.toggle('active', b.dataset.t === m));
+  }
+  render();
+  if (currentFolder) renderGrid();
+}
+for (const id of ['#thumbSeg', '#thumbSeg2']) {
+  $(id).addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    setThumbMode(b.dataset.t);
+  });
+}
+
+// ---- 缩略图尺寸档位
+let thumbSize = localStorage.getItem('thumbSize') || 'l';   // s | m | l | xl
+
+// 大图画质：preview = 服务端 2048px 预览；full = 原图直出
+// 默认：本机用原图，局域网/手机用预览（否则一张 52MB 的图要等很久）
+const IS_LOCAL = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname || 'localhost');
+let bigQuality = localStorage.getItem('bigQuality') || (IS_LOCAL ? 'full' : 'preview');
+function setBigQuality(q) {
+  bigQuality = q === 'full' ? 'full' : 'preview';
+  localStorage.setItem('bigQuality', bigQuality);
+  if ($('#lb').classList.contains('show') && lbIndex >= 0) openLightbox(lbIndex, { mode: 'none' });
+}
+const SIZE_CLASS = { s: 'sz-s', m: 'sz-m', l: 'sz-l', xl: 'sz-xl' };
+function setThumbSize(s) {
+  thumbSize = SIZE_CLASS[s] ? s : 'l';
+  localStorage.setItem('thumbSize', thumbSize);
+  document.body.classList.remove('sz-s', 'sz-m', 'sz-l', 'sz-xl');
+  document.body.classList.add(SIZE_CLASS[thumbSize]);
+  for (const id of ['#sizeSeg', '#sizeSeg2']) {
+    const seg = $(id); if (!seg) continue;
+    [...seg.children].forEach((b) => b.classList.toggle('active', b.dataset.s === thumbSize));
+  }
+}
+for (const id of ['#sizeSeg', '#sizeSeg2']) {
+  $(id).addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    setThumbSize(b.dataset.s);
+  });
+}
+
+// ---------------------------------------------------------------- 拉取状态
+async function pull() {
+  try {
+    const r = await fetch('/api/state');
+    STATE = await r.json();
+    renderHeader();
+    render();
+    // 首次加载时带 #folder=... 的地址（刷新/分享），数据到了再打开
+    if (pendingNav && pendingNav.folder && STATE.folders.some((f) => f.rel === pendingNav.folder)) {
+      const nav = pendingNav; pendingNav = null;
+      // 先把当前那条历史记成"总览页"，再 push 一个文件夹条目，这样后退是回总览而不是离开网站
+      history.replaceState(null, '', location.pathname + location.search);
+      openFolder(nav.folder, { push: true, photo: nav.photo });
+    }
+    if (STATE.status === 'scanning') setTimeout(pull, 400);
+  } catch (e) {
+    setTimeout(pull, 1500);
+  }
+}
+
+function renderHeader() {
+  const t = STATE.totals || {};
+  $('#rootPath').textContent = STATE.root || '';
+  const lanEl = $('#lanUrl');
+  if (lanEl) {
+    const lan = (STATE.urls || []).find((u) => /^http:\/\/(?!127\.|localhost)/.test(u));
+    if (lan) { lanEl.textContent = '局域网 ' + lan.replace('http://', ''); lanEl.dataset.url = lan; lanEl.style.display = ''; }
+    else lanEl.style.display = 'none';
+  }
+  $('#tFolders').textContent = fmtNum(t.folders);
+  $('#tFiles').textContent = fmtNum(t.files);
+  $('#tSize').textContent = fmtSize(t.bytes);
+  const scanning = STATE.status === 'scanning';
+  $('#progBar').style.display = scanning ? 'block' : 'none';
+  $('#scanLine').style.display = scanning ? 'flex' : 'none';
+  if (scanning) {
+    const p = STATE.progress || {};
+    const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+    $('#progBar').firstElementChild.style.width = pct + '%';
+    $('#scanText').textContent = `正在扫描 ${p.done}/${p.total} 个文件夹… ${p.current || ''}（已发现 ${fmtSize(p.bytes)}）`;
+    $('#tTime').textContent = '扫描中';
+  } else {
+    $('#tTime').textContent = STATE.elapsedMs ? (STATE.elapsedMs / 1000).toFixed(1) + 's' : '';
+  }
+}
+
+// ---------------------------------------------------------------- 总览渲染
+function folderKinds(f) {
+  const k = f.kinds || {};
+  return {
+    jpg: (k.jpg || {}).n || 0,
+    raw: (k.raw || {}).n || 0,
+    heif: (k.heif || {}).n || 0,
+    video: (k.video || {}).n || 0,
+    other: (k.other || {}).n || 0,
+  };
+}
+
+function render() {
+  const q = ($('#q').value || '').trim().toLowerCase();
+  let folders = STATE.folders.slice();
+
+  if (q) {
+    folders = folders.filter((f) => {
+      const cams = ((f.exif || {}).cameras || []).map((c) => c.name).join(' ');
+      return (f.name + ' ' + cams).toLowerCase().includes(q);
+    });
+  }
+
+  if (sortKey === 'size') folders.sort((a, b) => b.bytes - a.bytes);
+  else if (sortKey === 'files') folders.sort((a, b) => b.files - a.files);
+  else if (sortKey === 'dateUp') folders.sort((a, b) => a.name.localeCompare(b.name));
+  else folders.sort((a, b) => b.name.localeCompare(a.name));
+
+  const maxBytes = Math.max(1, ...STATE.folders.map((f) => f.bytes));
+
+  // 按年分组（仅在按日期排序时分组）
+  const groups = new Map();
+  for (const f of folders) {
+    let key;
+    if (sortKey === 'size' || sortKey === 'files') key = '';
+    else {
+      const m = /^(\d{4})/.exec(f.name);
+      key = m ? m[1] : '其它';
+    }
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(f);
+  }
+
+  const html = [];
+  for (const [year, list] of groups) {
+    const sum = list.reduce((a, f) => a + f.bytes, 0);
+    const n = list.reduce((a, f) => a + f.files, 0);
+    if (year) {
+      const coll = collapsedYears.has(year);
+      html.push(`<section class="year ${coll ? 'collapsed' : ''}" data-year="${year}">
+        <div class="year-h"><span class="chev">▼</span><h2>${year}</h2>
+        <span class="sum">${list.length} 个文件夹 · ${fmtNum(n)} 个文件 · ${fmtSize(sum)}</span></div>
+        <div class="rows">`);
+    } else {
+      html.push(`<section class="year"><div class="rows">`);
+    }
+    for (const f of list) {
+      const k = folderKinds(f);
+      const badges = [];
+      if (k.jpg) badges.push(`<span class="badge jpg">JPG ${fmtNum(k.jpg)}</span>`);
+      if (k.raw) badges.push(`<span class="badge raw">RAW ${fmtNum(k.raw)}</span>`);
+      if (k.heif) badges.push(`<span class="badge jpg">HEIF ${fmtNum(k.heif)}</span>`);
+      if (k.video) badges.push(`<span class="badge video">视频 ${fmtNum(k.video)}</span>`);
+      if (k.other) badges.push(`<span class="badge other">其它 ${fmtNum(k.other)}</span>`);
+      const cam = ((f.exif || {}).cameras || [])[0];
+      const samp = (f.exif || {}).sample || {};
+      const sub = f.subdirs && f.subdirs.length ? `${f.subdirs.length} 个子文件夹` : '';
+      const cover = (thumbMode === 'auto' && f.cover)
+        ? `<img class="cover" loading="lazy" src="/api/prev?rel=${enc(f.cover)}" alt="">`
+        : `<div class="cover ph"><b>${f.name.slice(0, 4)}</b>${f.name.slice(5) || '&nbsp;'}</div>`;
+      html.push(`<div class="row" data-rel="${f.rel.replace(/"/g, '&quot;')}">
+        ${cover}
+        <div class="name">${f.name}${sub ? `<small>${sub}</small>` : ''}</div>
+        <div class="size"><b>${fmtSize(f.bytes)}</b>
+          <div class="minibar"><i style="width:${Math.max(2, (f.bytes / maxBytes) * 100)}%"></i></div></div>
+        <div class="num">${fmtNum(f.files)} 文件</div>
+        <div class="num">${fmtNum(k.jpg + k.raw + k.heif)} 张照片</div>
+        <div class="badges">${badges.join('')}</div>
+        <div class="cam">${cam ? cam.name : '<span style="color:var(--fg3)">—</span>'}
+          ${samp.date ? `<small>${samp.date.slice(0, 10)}</small>` : ''}</div>
+        <button class="open" title="在资源管理器中打开">打开</button>
+      </div>`);
+    }
+    html.push(`</div></section>`);
+  }
+
+  if (!folders.length) {
+    html.push(`<div class="empty">${STATE.status === 'scanning' ? '扫描中…' : '没有匹配的文件夹'}</div>`);
+  }
+  $('#overview').innerHTML = html.join('');
+  $('#hintText').textContent = `共 ${fmtNum(STATE.folders.length)} 个文件夹` + (q ? ` · 匹配 ${folders.length}` : '');
+}
+
+// 事件委托：总览
+$('#overview').addEventListener('click', (e) => {
+  const yh = e.target.closest('.year-h');
+  if (yh) {
+    const y = yh.parentElement.dataset.year;
+    if (y) {
+      collapsedYears.has(y) ? collapsedYears.delete(y) : collapsedYears.add(y);
+      yh.parentElement.classList.toggle('collapsed');
+    }
+    return;
+  }
+  const row = e.target.closest('.row');
+  if (!row) return;
+  if (e.target.closest('.open')) {
+    e.stopPropagation();
+    fetch('/api/reveal?rel=' + enc(row.dataset.rel)).then(() => toast('已在资源管理器中打开'));
+    return;
+  }
+  openFolder(row.dataset.rel);
+});
+
+$('#q').addEventListener('input', render);
+$('#lanUrl').addEventListener('click', async () => {
+  const url = $('#lanUrl').dataset.url;
+  if (!url) return;
+  try { await navigator.clipboard.writeText(url); toast('已复制：' + url); }
+  catch { toast(url); }
+});
+$('#sortSeg').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  sortKey = b.dataset.sort;
+  [...$('#sortSeg').children].forEach((x) => x.classList.toggle('active', x === b));
+  render();
+});
+$('#btnRescan').addEventListener('click', async () => {
+  await fetch('/api/rescan');
+  toast('重新扫描中…');
+  setTimeout(pull, 100);
+});
+
+$('#btnCache').addEventListener('click', async () => {
+  const s = await (await fetch('/api/cache/stats')).json();
+  const msg = `缩略图缓存：${fmtNum(s.files)} 个文件，${fmtSize(s.bytes)}\n索引缓存：${fmtSize(s.index)}\n上限：${fmtSize(s.cap)}\n\n确定清空缩略图缓存吗？（下次浏览会重新生成）`;
+  if (!confirm(msg)) return;
+  await fetch('/api/cache/clear');
+  toast('缩略图缓存已清空');
+});
+
+// ---------------------------------------------------------------- 文件夹详情
+async function openFolder(rel, opts = {}) {
+  const f = STATE.folders.find((x) => x.rel === rel);
+  if (!f) return;
+  currentFolder = f;
+  $('#detail').classList.add('show');
+  // 写入历史记录：浏览器的后退键就能退回总览
+  if (opts.push !== false) {
+    const hash = hashFor(rel);
+    if (location.hash !== hash) history.pushState({ folder: rel }, '', hash);
+  }
+  $('#dTitle').textContent = f.name;
+  const k = folderKinds(f);
+  const samp = (f.exif || {}).sample || {};
+  const cams = ((f.exif || {}).cameras || []).map((c) => c.name).join(' / ');
+  $('#dMeta').innerHTML = [
+    `<span>总大小 <b>${fmtSize(f.bytes)}</b></span>`,
+    `<span>文件 <b>${fmtNum(f.files)}</b></span>`,
+    k.jpg + k.raw + k.heif ? `<span>照片 <b>${fmtNum(k.jpg + k.raw + k.heif)}</b>（RAW ${fmtNum(k.raw)}）</span>` : '',
+    k.video ? `<span>视频 <b>${fmtNum(k.video)}</b></span>` : '',
+    cams ? `<span>相机 <b>${cams}</b></span>` : '',
+    samp.dims || samp.f ? `<span>规格 ${[samp.dims, samp.f, samp.shutter, samp.iso].filter(Boolean).join(' · ')}</span>` : '',
+  ].filter(Boolean).join('');
+
+  $('#dSubs').innerHTML = (f.subdirs || []).map((s) => `
+    <div class="sub"><span class="n">📁 ${s.name}</span>
+      <span style="color:var(--fg3);font-size:11.5px">${fmtNum(s.files)} 个文件</span>
+      <span class="s">${fmtSize(s.bytes)}</span></div>`).join('');
+
+  $('#grid').innerHTML = '<div class="empty">读取中…</div>';
+  const r = await fetch('/api/folder?rel=' + enc(rel));
+  const data = await r.json();
+  currentFiles = data.fileList || [];
+  renderGrid();
+  // 地址里带了 &p=xxx（刷新 / 分享 / 前进后退）就直接弹出那张
+  if (opts.photo) {
+    const idx = findGroupIndex(opts.photo);
+    if (idx >= 0) openLightbox(idx, { mode: opts.push === false ? 'none' : 'push' });
+  }
+}
+
+// 把同名 JPG/RAW 配成一张卡片
+// 把同名 JPG/RAW 配成一张卡片
+function groupFiles(files) {
+  const map = new Map();
+  for (const [rel, size, mt] of files) {
+    const base = rel.replace(/\.[^.]+$/, '');
+    const name = rel.split('/').pop();
+    const kind = extKind(name);
+    let g = map.get(base);
+    if (!g) { g = { base, items: [], videos: [] }; map.set(base, g); }
+    g.items.push({ rel, size, mt, kind, name, ext: (name.match(/\.[^.]+$/) || [''])[0].toUpperCase() });
+    if (kind === 'video') g.videos.push(rel);
+  }
+  const out = [...map.values()];
+  for (const g of out) {
+    const pri = { raw: 3, jpg: 2, heif: 1, video: 4, other: 0 };
+    g.items.sort((a, b) => pri[b.kind] - pri[a.kind]);
+    g.main = g.items[0];
+    g.size = g.items.reduce((a, i) => a + i.size, 0);
+    // RAW 优先（内嵌预览小、快），但视频单独处理
+    g.kinds = [...new Set(g.items.map((i) => i.kind))];
+    g.preview =
+      g.items.find((i) => i.kind === 'raw') ||
+      g.items.find((i) => i.kind === 'jpg') ||
+      g.items.find((i) => i.kind === 'heif') ||
+      g.items.find((i) => i.kind === 'video') || g.items[0];
+  }
+  out.sort((a, b) => a.base.localeCompare(b.base));
+  return out;
+}
+
+function renderGrid() {
+  abortGridDownloads();   // 先取消上一轮没下载完的，避免堆积
+  const groups = groupFiles(currentFiles);
+  const shown = groups.filter((g) => {
+    const ks = g.kinds;
+    if (filter === 'all') return true;
+    if (filter === 'photo') return ks.includes('jpg') || ks.includes('raw') || ks.includes('heif');
+    if (filter === 'raw') return ks.includes('raw');
+    if (filter === 'video') return ks.includes('video');
+    if (filter === 'other') return ks.includes('other') && !ks.some((k) => k !== 'other');
+    return true;
+  });
+  if (!shown.length) {
+    $('#grid').innerHTML = '<div class="empty">这里没有可显示的项目</div>';
+    $('#gridHint').textContent = '';
+    return;
+  }
+  $('#gridHint').textContent = `${shown.length} 项` + (groups.length !== shown.length ? ` / 共 ${groups.length}` : '') +
+    (thumbMode === 'off' ? ' · 点击卡片加载缩略图，再点一次看大图' : ' · 点击看大图');
+
+  if (thumbMode === 'off') {
+    $('#grid').innerHTML = shown.map((g, i) => {
+      const tags = g.kinds.map((k) => `<span class="${kindClass(k)}">${KIND_LABEL[k]}</span>`).join('');
+      const name = g.main.name.replace(/\.[^.]+$/, '');
+      return `<div class="card ph" data-i="${i}" title="${g.main.name} · ${fmtSize(g.size)}（点击加载缩略图）">
+        <span class="e">${g.items.map((x) => x.ext.replace('.', '')).join('+')}</span>
+        <span class="n">${name}</span>
+        <span class="s">${fmtSize(g.size)}</span>
+        <div class="tag">${tags}</div></div>`;
+    }).join('');
+    window._shownGroups = shown;
+    return;
+  }
+
+  $('#grid').innerHTML = shown.map((g, i) => {
+    const tags = g.kinds.map((k) => `<span class="${kindClass(k)}">${KIND_LABEL[k]}</span>`).join('');
+    return `<div class="card loading" data-i="${i}" title="${g.main.name}">
+      <img data-src="/api/prev?rel=${enc(g.preview.rel)}" alt="" decoding="async" loading="lazy">
+      <div class="tag">${tags}</div></div>`;
+  }).join('');
+
+  // 懒加载：只拉“当前视野附近”的，按距视口中心远近排序
+  // —— 跳到未尾时，旧位置的在飞请求会被取消，新的立刻占用并发位
+  gridWant = new Set();
+  gridActive = new Set();
+  gridIO = new IntersectionObserver((ents) => {
+    for (const e of ents) {
+      const card = e.target;
+      if (e.isIntersecting) {
+        gridWant.add(card);
+      } else {
+        gridWant.delete(card);
+        const img = card.querySelector('img');
+        // 已经滚出视野但还在下载 → 直接取消，把并发位让给看得见的
+        if (gridActive.has(card) && img && !img.complete && img.getAttribute('src')) {
+          gridActive.delete(card);
+          img.removeAttribute('src');
+          card.classList.add('loading');
+        }
+      }
+    }
+    pumpGrid();
+  }, { root: null, rootMargin: '150px' });
+  document.querySelectorAll('#grid .card').forEach((c) => gridIO.observe(c));
+  pumpGrid();
+
+  window._shownGroups = shown;
+}
+
+/** 按“离视口中心最近优先”派发缩略图请求 */
+function pumpGrid() {
+  if (!gridIO) return;                       // 网格已关闭/暂停
+  const vh = window.innerHeight || 800;
+  const queued = [];
+  for (const card of gridWant) {
+    const img = card.querySelector('img');
+    if (!img || !img.dataset.src || img.getAttribute('src')) continue;
+    const r = card.getBoundingClientRect();
+    queued.push({ card, img, d: Math.abs(r.top + r.height / 2 - vh / 2) });
+  }
+  if (!queued.length) return;
+  queued.sort((a, b) => a.d - b.d);
+  for (const { card, img } of queued) {
+    if (gridActive.size >= GRID_CONCURRENCY) break;
+    if (!gridIO) break;
+    gridActive.add(card);
+    let settled = false;
+    let timer = null;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      gridActive.delete(card);
+      card.classList.remove('loading');
+      pumpGrid();
+    };
+    // 兜底：万一既没 load 也没 error（请求被浏览器丢弃），也不会永久占着并发名额
+    timer = setTimeout(() => {
+      if (!img.complete) { try { img.removeAttribute('src'); } catch {} }
+      done();
+    }, 20000);
+    img.addEventListener('load', done, { once: true });
+    img.addEventListener('error', done, { once: true });
+    img.src = img.dataset.src;
+  }
+}
+
+/** 一张照片的唯一标识：文件名去掉扩展名（不含目录） */
+function groupBase(g) {
+  return g.main.rel.replace(/\.[^.]+$/, '').split('/').pop();
+}
+function findGroupIndex(base) {
+  const groups = window._shownGroups || [];
+  return groups.findIndex((g) => groupBase(g) === base);
+}
+
+/** 点击卡片加缩略图（缩略图关闭模式） */
+function loadCardThumb(card, g) {
+  card.classList.add('loading');
+  const img = document.createElement('img');
+  img.decoding = 'async';
+  img.alt = g.main.name;
+  img.onload = () => card.classList.remove('loading');
+  img.onerror = () => { card.classList.remove('loading'); toast('这张图无法生成预览'); };
+  img.src = '/api/prev?rel=' + enc(g.preview.rel);
+  card.querySelectorAll('.e,.n,.s').forEach((n) => n.remove());
+  card.prepend(img);
+  card.dataset.loaded = '1';
+  card.title = g.main.name + ' · ' + fmtSize(g.size) + '（再点一次看大图）';
+}
+
+$('#filterSeg').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  filter = b.dataset.f;
+  [...$('#filterSeg').children].forEach((x) => x.classList.toggle('active', x === b));
+  renderGrid();
+});
+
+$('#btnBack').addEventListener('click', () => closeDetail());
+$('#btnOpenFolder').addEventListener('click', () => {
+  if (currentFolder) fetch('/api/reveal?rel=' + enc(currentFolder.rel)).then(() => toast('已在资源管理器中打开'));
+});
+
+/** 关闭详情页；updateHistory=true 时会让浏览器地址栏也跟着回退 */
+/** 取消网格里还没下载完的缩略图（浏览器会真的断开请求，服务端跟着 abort ffmpeg） */
+function abortGridDownloads() {
+  document.querySelectorAll('#grid .card img').forEach((img) => {
+    if (!img.complete) {
+      const s = img.getAttribute('src');
+      if (s) { img.dataset.src = s; img.removeAttribute('src'); }
+    }
+  });
+  gridActive.clear();
+  gridWant.clear();
+}
+
+function closeDetail(updateHistory = true) {
+  $('#detail').classList.remove('show');
+  currentFolder = null;
+  if (gridIO) { gridIO.disconnect(); gridIO = null; }
+  abortGridDownloads();
+  // 清空网格：释放已解码的图片占的内存（否则藏在 waite 里的几百张会一直佔着）
+  $('#grid').innerHTML = '';
+  currentFiles = [];
+  window._shownGroups = [];
+  resumeThumbWork();
+  if (!updateHistory) return;
+  if (history.state && history.state.folder) {
+    history.back();           // 回到我们 push 的那一条（会触发 popstate）
+  } else {
+    // 直接带 hash 打开的：只清掉 hash，不产生后退
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+}
+
+/** 根据地址栏状态（文件夹 / 某张照片）还原界面，后退前进都走这里 */
+function applyNav(nav) {
+  const lbOpen = $('#lb').classList.contains('show');
+  if (!nav.folder) {
+    if (lbOpen) closeLightbox(false);
+    closeDetail(false);
+    return;
+  }
+  if (!currentFolder || currentFolder.rel !== nav.folder) {
+    openFolder(nav.folder, { push: false, photo: nav.photo });
+    return;
+  }
+  if (nav.photo) {
+    const idx = findGroupIndex(nav.photo);
+    if (idx >= 0) openLightbox(idx, { mode: 'none' });
+    else if (lbOpen) closeLightbox(false);
+  } else if (lbOpen) {
+    closeLightbox(false);      // 从大图退回网格
+  }
+}
+
+// 浏览器前进/后退
+window.addEventListener('popstate', () => applyNav(parseNav()));
+
+// ---------------------------------------------------------------- 大图
+$('#grid').addEventListener('click', (e) => {
+  const card = e.target.closest('.card'); if (!card) return;
+  const g = (window._shownGroups || [])[+card.dataset.i];
+  if (!g) return;
+  // 缩略图关闭模式：第一次点击先加载缩略图
+  if (card.classList.contains('ph') && card.dataset.loaded !== '1') {
+    loadCardThumb(card, g);
+    return;
+  }
+  openLightbox(+card.dataset.i);
+});
+
+/** 清空大图舞台：必须显式 pause + 解除 src，否则 display:none 藏起来后视频还会继续响 */
+function clearStage() {
+  const stage = $('#lbStage');
+  if (!stage) return;
+  stage.classList.remove('zoomed');
+  stage.classList.remove('dragging');
+  lbDrag = null;
+  lbTouch = null;
+  lbPinch = null;
+  lbView = null;
+  lbLastDragAt = 0;
+  const canvasEl = $('#lbCanvas');
+  if (canvasEl) {
+    canvasEl.scrollLeft = 0;
+    canvasEl.scrollTop = 0;
+  }
+  if (canvasEl) canvasEl.querySelectorAll('video').forEach((v) => {
+    try { v.pause(); } catch {}
+    try { v.removeAttribute('src'); v.load(); } catch {}   // 释放解码器
+    v.remove();
+  });
+  if (canvasEl) canvasEl.querySelectorAll('img').forEach((i) => {
+    try { i.removeAttribute('src'); } catch {}
+    i.remove();
+  });
+}
+
+async function openLightbox(i, opts = {}) {
+  const groups = window._shownGroups || [];
+  const g = groups[i]; if (!g) return;
+  lbIndex = i;
+  const isVideo = g.kinds.includes('video') && !g.kinds.some((k) => k === 'raw' || k === 'jpg' || k === 'heif');
+  const p = g.preview;
+  const stage = $('#lbStage');
+  clearStage();
+  if (isVideo) {
+    const v = document.createElement('video');
+    v.src = '/api/media?rel=' + enc(g.videos[0]);
+    v.controls = true; v.autoplay = true; v.playsInline = true;
+    v.setAttribute('tabindex', '-1');   // 别抢焦点，否则左右方向键会被视频拿去快进
+    $('#lbCanvas').appendChild(v);
+    v.blur();
+  } else {
+    const img = document.createElement('img');
+    const jpg = g.items.find((x) => x.kind === 'jpg');
+    const heif = g.items.find((x) => x.kind === 'heif');
+    // 有 JPG 就用原图；只有 RAW / HEIF 时用服务端预览（浏览器不能解码）
+    if (jpg) {
+      img.src = bigQuality === 'full'
+        ? '/api/media?rel=' + enc(jpg.rel)
+        : '/api/bigprev?rel=' + enc(jpg.rel);
+    } else if (p.kind === 'raw' || p.kind === 'heif') {
+      img.src = '/api/bigprev?rel=' + enc(p.rel);
+    } else {
+      img.src = '/api/media?rel=' + enc(p.rel);
+    }
+    $('#lbCanvas').appendChild(img);
+    img.addEventListener('load', () => lbReset(img));
+    if (img.complete && img.naturalWidth) lbReset(img);
+    // 加载完成后把真实像素尺寸显示出来，方便确认当前看的是原图还是预览
+    img.addEventListener('load', () => {
+      const nt = $('#qualityNote');
+      if (!nt) return;
+      const tag = !jpg
+        ? (p.kind === 'raw' ? 'RAW 内嵌预览' : 'HEIF 转码预览')
+        : (bigQuality === 'full' ? '原图' : '高清预览');
+      nt.textContent = `${tag} · ${img.naturalWidth}×${img.naturalHeight}`;
+    });
+  }
+
+  // 画质开关：只有“有 JPG 同号”的组才有意义
+  const hasJpg = !!g.items.find((x) => x.kind === 'jpg');
+  const qSeg = $('#qualitySeg');
+  const forceBtn = $('#lbForceFull');
+  if (forceBtn) {
+    const jpgItem = g.items.find((x) => x.kind === 'jpg');
+    const bigEnough = !!jpgItem && jpgItem.size > 3 * 1024 * 1024;
+    forceBtn.style.display = (hasJpg && bigQuality === 'preview' && bigEnough) ? '' : 'none';
+  }
+  if (qSeg) {
+    qSeg.style.display = hasJpg ? '' : 'none';
+    [...qSeg.children].forEach((b) => b.classList.toggle('active', b.dataset.q === bigQuality));
+    const note = $('#qualityNote');
+    if (note) {
+      if (!hasJpg) {
+        note.textContent = p.kind === 'raw' ? '显示的是 RAW 内嵌预览（浏览器无法解码 RAW）'
+          : (p.kind === 'heif' ? 'HEIF 已转码为 JPEG 预览' : '');
+      } else if (bigQuality === 'full') {
+        note.textContent = '原图加载中…（文件可能很大）';
+      } else {
+        note.textContent = '生成 2048px 预览中…';
+      }
+    }
+  }
+  $('#lbName').textContent = p.name;
+  const info = [
+    ['大小', g.items.map((x) => `${x.ext.replace('.', '')} ${fmtSize(x.size)}`).join('  ·  ')],
+    ['类型', g.items.map((x) => x.ext.replace('.', '')).join(' + ')],
+    ['路径', g.main.rel],
+  ];
+  $('#lbInfo').innerHTML = info.map(([k, v]) => `<b>${k}</b><span>${v}</span>`).join('') +
+    `<b>EXIF</b><span id="lbExif" style="color:var(--fg2)">读取中…</span>`;
+
+  // 下载走 /api/download：响应带 Content-Disposition，文件名和扩展名才正确
+  const shown = g.items.find((x) => x.kind === 'jpg') || p;
+  const dl = $('#lbDownload');
+  dl.href = '/api/download?rel=' + enc(shown.rel);
+  dl.setAttribute('download', shown.name);
+  const rawItem = shown.kind === 'raw' ? null : g.items.find((x) => x.kind === 'raw');
+  const dlRaw = $('#lbDownloadRaw');
+  if (rawItem) {
+    dlRaw.style.display = '';
+    dlRaw.href = '/api/download?rel=' + enc(rawItem.rel);
+    dlRaw.setAttribute('download', rawItem.name);
+  } else {
+    dlRaw.style.display = 'none';
+  }
+  $('#lb').classList.add('show');
+
+  // 播视频时把所有缩略图生成/下载停掉（否则 ffmpeg 抽帧 + 浏览器解码 4K 双重抢硬件，必卡）
+  if (isVideo) pauseThumbWork(); else resumeThumbWork();
+
+  // 历史记录：push 一条带照片的地址，后退键就能退回网格
+  const mode = opts.mode || 'push';
+  if (mode !== 'none' && currentFolder) {
+    const base = groupBase(g);
+    const url = hashFor(currentFolder.rel, base);
+    const st = { folder: currentFolder.rel, p: base };
+    if (mode === 'replace') history.replaceState(st, '', url);
+    else if (location.hash !== url) history.pushState(st, '', url);
+  }
+
+  fetch('/api/exif?rel=' + enc(p.rel)).then((r) => r.json()).then((d) => {
+    const e = d.exif;
+    const el = $('#lbExif'); if (!el) return;
+    if (!e) { el.textContent = '无'; return; }
+    el.textContent = [e.camera, e.lens, e.date, e.f, e.shutter, e.iso, e.focal, e.dims].filter(Boolean).join(' · ') || '无';
+  }).catch(() => {});
+}
+
+function lbMove(d) {  const groups = window._shownGroups || [];
+  const n = groups.length; if (!n) return;
+  // 翻页用 replaceState：否则连翻 20 张就要按 20 次后退才能出去
+  openLightbox((lbIndex + d + n) % n, { mode: 'replace' });
+}
+
+/** 暂停缩略图：断掉懒加载、取消未完成的图片请求、通知服务端杀掉正在跑的 ffmpeg */
+async function pauseThumbWork() {
+  if (thumbWorkPaused) return;
+  thumbWorkPaused = true;
+  if (gridIO) { gridIO.disconnect(); gridIO = null; }
+  abortGridDownloads();
+  const beat = () => { fetch('/api/preview/pause', { method: 'POST' }).catch(() => {}); };
+  beat();
+  // 心跳续期：避免“关标签页/刷新”时来不及发 resume，导致服务端一直被挂住
+  clearInterval(pauseHeartbeat);
+  pauseHeartbeat = setInterval(beat, 10000);
+}
+
+/** 恢复缩略图：重新渲染网格，重新开始懒加载 */
+async function resumeThumbWork() {
+  clearInterval(pauseHeartbeat);
+  pauseHeartbeat = null;
+  if (!thumbWorkPaused) {
+    // 页面刚打开也要确保服务端没有残留暂停状态
+    fetch('/api/preview/resume', { method: 'POST' }).catch(() => {});
+    return;
+  }
+  thumbWorkPaused = false;
+  try { await fetch('/api/preview/resume', { method: 'POST' }); } catch {}
+  if (currentFolder) renderGrid();
+}
+
+// 关标签页 / 刷新 / 切走时立即解除暂停（心跳意外失败也安全）
+function releaseOnLeave() {
+  if (!thumbWorkPaused) return;
+  try { navigator.sendBeacon('/api/preview/resume'); } catch {}
+}
+window.addEventListener('pagehide', releaseOnLeave);
+window.addEventListener('beforeunload', releaseOnLeave);
+
+/** 关大图；updateHistory=true 时后退一格（回到网格） */
+function closeLightbox(updateHistory = true) {
+  if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); }
+  clearStage();                  // 先停掉视频/释放解码器
+  $('#lb').classList.remove('show');
+  lbIndex = -1;
+  resumeThumbWork();
+  if (!updateHistory) return;
+  if (history.state && history.state.p) {
+    history.back();
+  } else if (currentFolder) {
+    history.replaceState({ folder: currentFolder.rel }, '', hashFor(currentFolder.rel));
+  } else {
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+}
+
+$('#lbPrev').addEventListener('click', () => lbMove(-1));
+$('#lbNext').addEventListener('click', () => lbMove(1));
+
+// ================= 大图查看：transform 缩放（原生手感） =================
+// 用 transform: translate + scale，而不是改 width/height
+// —— 不触发布局重排，缩放/平移只走合成层，才能真正顺滑
+const LB_MAX_ZOOM = 4;      // 相对原图 100% 的最高 4 倍（= 400%）
+const IS_MAC = /Mac|iPhone|iPad|iPod/.test((navigator.platform || '') + ' ' + (navigator.userAgent || ''));
+
+let lbView = null;          // { img, nw, nh, scale, tx, ty }
+let lbLastDragAt = 0;    // 上一次真实拖拽结束的时间
+const lbJustDragged = () => Date.now() - lbLastDragAt < 350;
+let lbApplyQueued = false;
+
+function lbImg() {
+  const c = $('#lbCanvas');
+  return c ? c.querySelector('img') : null;
+}
+function lbCanvas() { return $('#lbCanvas'); }
+
+/** 适应屏幕时的倍率（相对原图像素）；小图不放大，最多 1 */
+function lbFitScale() {
+  const v = lbView, c = lbCanvas();
+  if (!v || !c) return 1;
+  const availW = Math.max(80, c.clientWidth - 120);   // 左右各留 60px 给导航按钮
+  const availH = Math.max(80, c.clientHeight - 28);
+  return Math.min(availW / v.nw, availH / v.nh, 1);
+}
+
+let lbAnimTimer = null;
+/** 拖拽/滚轮/捏合进行中：关掉过渡，保证 1:1 跟手；停手 220ms 后恢复 */
+function lbLive() {
+  const img = lbView && lbView.img;
+  if (!img) return;
+  img.style.transition = 'none';
+  clearTimeout(lbAnimTimer);
+  lbAnimTimer = setTimeout(() => { if (lbView) lbView.img.style.transition = ''; }, 220);
+}
+
+function lbApply() {
+  if (!lbView) return;
+  const v = lbView;
+  v.img.style.transform = `translate3d(${v.tx}px, ${v.ty}px, 0) scale(${v.scale})`;
+}
+
+/** 同一帧内多次缩放只应用一次，避免抖动 */
+function lbScheduleApply() {
+  if (lbApplyQueued) return;
+  lbApplyQueued = true;
+  requestAnimationFrame(() => { lbApplyQueued = false; lbApply(); });
+}
+
+/** 限制在画布内：比画布小就居中，比画布大就不让露出空白 */
+function lbClamp() {
+  const v = lbView, c = lbCanvas();
+  if (!v || !c) return;
+  const w = v.nw * v.scale, h = v.nh * v.scale;
+  const cw = c.clientWidth, ch = c.clientHeight;
+  v.tx = w <= cw ? (cw - w) / 2 : Math.min(0, Math.max(cw - w, v.tx));
+  v.ty = h <= ch ? (ch - h) / 2 : Math.min(0, Math.max(ch - h, v.ty));
+}
+
+/** 以画布内坐标 (px,py) 为锚点缩放到 scale —— 锚点下的像素保持不动 */
+function lbZoomTo(scale, px, py) {
+  const v = lbView;
+  if (!v) return;
+  const fit = lbFitScale();
+  const ns = Math.max(fit, Math.min(LB_MAX_ZOOM, scale));
+  if (Math.abs(ns - v.scale) < 1e-5) return;
+  const ix = (px - v.tx) / v.scale;     // 锚点对应的原图像素坐标
+  const iy = (py - v.ty) / v.scale;
+  v.scale = ns;
+  v.tx = px - ix * ns;
+  v.ty = py - iy * ns;
+  v.atFit = ns <= fit + 1e-4;
+  lbClamp();
+  lbScheduleApply();
+  $('#lbStage').classList.toggle('zoomed', ns > fit + 1e-4);
+}
+
+/** 初始化（图片 load 后调用）：按“适应屏幕”摆放 */
+function lbReset(img) {
+  if (!img || !img.naturalWidth) return;
+  img.style.position = 'absolute';
+  img.style.left = '0';
+  img.style.top = '0';
+  img.style.maxWidth = 'none';
+  img.style.maxHeight = 'none';
+  img.style.width = img.naturalWidth + 'px';
+  img.style.height = img.naturalHeight + 'px';
+  img.style.transformOrigin = '0 0';
+  img.style.willChange = 'transform';
+  img.style.touchAction = 'none';
+  img.style.transition = '';
+  lbView = { img, nw: img.naturalWidth, nh: img.naturalHeight, scale: 1, tx: 0, ty: 0, atFit: true };
+  lbView.scale = lbFitScale();
+  lbClamp();
+  lbApply();
+  $('#lbStage').classList.toggle('zoomed', false);
+}
+
+// ---------------- 鼠标：拖拽平移 / 点击切换 ----------------
+let lbDrag = null;
+
+$('#lbStage').addEventListener('pointerdown', (e) => {
+  const v = lbView;
+  if (!v || e.button !== 0) return;
+  if (e.target.closest('button')) return;            // 别拦上一张/下一张/全屏按钮
+  // 只要放大了，按在画布任意位置都能拖（图片四周的空白也算），
+  // 否则拖到边界后手指落在空白处就拖不动、松手还会被当成“点背景”
+  if (v.scale <= lbFitScale() + 1e-4) return;
+  // 注意：这里不能 preventDefault()，否则部分浏览器会连带抑制 click / dblclick，
+  // 导致“点一下缩小”“双击关闭”失效。防原生拖图交给 dragstart + user-select:none
+  lbDrag = { x: e.clientX, y: e.clientY, tx: v.tx, ty: v.ty, moved: 0 };
+  $('#lbStage').classList.add('dragging');
+  try { $('#lbStage').setPointerCapture(e.pointerId); } catch {}
+});
+
+$('#lbStage').addEventListener('pointermove', (e) => {
+  if (!lbDrag || !lbView) return;
+  const dx = e.clientX - lbDrag.x;
+  const dy = e.clientY - lbDrag.y;
+  lbDrag.moved = Math.max(lbDrag.moved, Math.hypot(dx, dy));
+  lbView.tx = lbDrag.tx + dx;
+  lbView.ty = lbDrag.ty + dy;
+  lbClamp();
+  lbLive();
+  lbScheduleApply();
+});
+
+function lbEndDrag() {
+  if (!lbDrag) return;
+  if (lbDrag.moved > 4) lbLastDragAt = Date.now();   // 拖过 → 接下来 350ms 内的 click 一律忽略
+  lbDrag = null;
+  $('#lbStage').classList.remove('dragging');
+}
+$('#lbStage').addEventListener('pointerup', lbEndDrag);
+$('#lbStage').addEventListener('pointercancel', lbEndDrag);
+$('#lbStage').addEventListener('dragstart', (e) => e.preventDefault());
+
+// ---------------- 滚轮 / 触控板捏合 ----------------
+$('#lbStage').addEventListener('wheel', (e) => {
+  const v = lbView;
+  if (!v || e.target.closest('img') !== v.img) return;
+  const c = lbCanvas().getBoundingClientRect();
+  const px = e.clientX - c.left;
+  const py = e.clientY - c.top;
+  const fit = lbFitScale();
+
+  // macOS 触控板“捏合”在浏览器里就是 wheel + ctrlKey —— 原生就是这个映射
+  // 这里接管它，阻止浏览器缩放整个页面，改成缩放照片
+  if (e.ctrlKey) {
+    e.preventDefault();
+    lbLive();
+    lbZoomTo(v.scale * Math.exp(-e.deltaY * 0.01), px, py);
+    return;
+  }
+
+  // Mac 上：鼠标滚轮（大 deltaY、无横向）当缩放；触控板双指滑动当平移
+  const mouseWheel = Math.abs(e.deltaY) >= 40 && Math.abs(e.deltaX) < 1;
+  if (IS_MAC && !mouseWheel) {
+    if (v.scale > fit + 1e-4) {          // 已放大 → 双指滑动平移（原生手感）
+      e.preventDefault();
+      v.tx -= e.deltaX;
+      v.ty -= e.deltaY;
+      lbClamp();
+      lbLive();
+      lbScheduleApply();
+    } else {
+      e.preventDefault();                // 未放大 → 双指滑动不做缩放（捏合才是缩放）
+    }
+    return;
+  }
+
+  // Windows / Mac 鼠标滚轮：缩放
+  e.preventDefault();
+  lbLive();
+  lbZoomTo(v.scale * Math.exp(-e.deltaY * 0.0016), px, py);
+}, { passive: false });
+
+// Safari 私有 gesture 事件（Safari 的触控板捏合有时不走 wheel+ctrlKey）
+let lbGesture = null;
+$('#lbStage').addEventListener('gesturestart', (e) => {
+  if (!lbView) return;
+  e.preventDefault();
+  const c = lbCanvas().getBoundingClientRect();
+  lbGesture = { scale: lbView.scale, px: e.clientX - c.left, py: e.clientY - c.top };
+});
+$('#lbStage').addEventListener('gesturechange', (e) => {
+  if (!lbGesture) return;
+  e.preventDefault();
+  lbZoomTo(lbGesture.scale * e.scale, lbGesture.px, lbGesture.py);
+});
+$('#lbStage').addEventListener('gestureend', (e) => { e.preventDefault(); lbGesture = null; });
+
+// ---------------- 点击：放大 / 缩小；放大后双击关闭 ----------------
+// 关键：不用延时区分单击/双击，改用 e.detail（click 的点击计数）
+//   detail === 1 → 单击，立即执行
+//   detail >= 2  → 双击的第二下，忽略（交给 dblclick 处理）
+// 这样“单击缩小”是瞬时的，同时双击也不会闪一下缩小再放大
+let lbZoomedBeforeDbl = false;   // 双击序列开始前是不是放大状态
+
+$('#lbStage').addEventListener('click', (e) => {
+  if (lbJustDragged()) return;
+  if (e.target.closest('button')) return;
+  const v = lbView;
+  if (!v) return;
+  if (lbPinch) return;
+
+  const c = lbCanvas().getBoundingClientRect();
+  const fit = lbFitScale();
+  const zoomed = v.scale > fit + 1e-4;
+  if (e.detail === 1) lbZoomedBeforeDbl = zoomed;   // 记录本轮点击的起始状态
+  if (e.detail > 1) return;                          // 双击第二下：什么都不做
+
+  if (zoomed) {
+    lbZoomTo(fit, c.width / 2, c.height / 2);        // 立即缩小
+  } else {
+    // 适应屏幕 → 1:1：只有点在图片上才有意义
+    if (e.target.closest('img') !== v.img) return;
+    lbZoomTo(1, e.clientX - c.left, e.clientY - c.top);
+  }
+});
+
+// 双击：放大状态下关闭大图
+$('#lbStage').addEventListener('dblclick', (e) => {
+  if (e.target.closest('button')) return;
+  if (!lbZoomedBeforeDbl) return;      // 在适应屏幕时双击 = 只是放大，不关闭
+  e.preventDefault();
+  closeLightbox();
+});
+
+// ---------------- 触屏：单指拖动 / 双指捏合 ----------------
+let lbTouch = null;
+let lbPinch = null;
+function touchDist(t) {
+  return Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY) || 1;
+}
+
+$('#lbStage').addEventListener('touchstart', (e) => {
+  const v = lbView;
+  if (!v || e.target.closest('img') !== v.img) return;
+  const c = lbCanvas().getBoundingClientRect();
+  if (e.touches.length === 2) {
+    lbPinch = {
+      d: touchDist(e.touches),
+      scale: v.scale,
+      mx: (e.touches[0].clientX + e.touches[1].clientX) / 2 - c.left,
+      my: (e.touches[0].clientY + e.touches[1].clientY) / 2 - c.top,
+    };
+    lbTouch = null;
+  } else if (e.touches.length === 1 && v.scale > lbFitScale() + 1e-4) {
+    lbTouch = { x: e.touches[0].clientX, y: e.touches[0].clientY, tx: v.tx, ty: v.ty, moved: 0 };
+  }
+}, { passive: true });
+
+$('#lbStage').addEventListener('touchmove', (e) => {
+  const v = lbView;
+  if (!v) return;
+  if (lbPinch && e.touches.length === 2) {
+    e.preventDefault();
+    lbLive();
+    lbZoomTo(lbPinch.scale * (touchDist(e.touches) / lbPinch.d), lbPinch.mx, lbPinch.my);
+  } else if (lbTouch && e.touches.length === 1) {
+    const dx = e.touches[0].clientX - lbTouch.x;
+    const dy = e.touches[0].clientY - lbTouch.y;
+    lbTouch.moved = Math.max(lbTouch.moved, Math.hypot(dx, dy));
+    v.tx = lbTouch.tx + dx;
+    v.ty = lbTouch.ty + dy;
+    lbClamp();
+    lbLive();
+    lbScheduleApply();
+    if (lbTouch.moved > 6) e.preventDefault();
+  }
+}, { passive: false });
+
+$('#lbStage').addEventListener('touchend', (e) => {
+  if (lbPinch && e.touches.length < 2) {
+    lbPinch = null;
+    lbLastDragAt = Date.now();      // 捏合结束别当成点击
+  }
+  if (lbTouch && lbTouch.moved > 6) lbLastDragAt = Date.now();
+  if (e.touches.length === 0) lbTouch = null;
+});
+
+// ---------------- 尺寸变化：还在“适应屏幕”就重新贴合 ----------------
+// 全屏切换时画布尺寸会变（而且带过渡动画），所以用 ResizeObserver 持续跟，
+// 不能只依赖 fullscreenchange —— 否则会先按旧尺寸显示一帧，再跳到新尺寸
+function lbRefitIfFit() {
+  if (!lbView) return;
+  const fit = lbFitScale();
+  if (lbView.atFit) lbView.scale = fit;
+  else if (lbView.scale < fit) lbView.scale = fit;   // 尺寸变大后别比 fit 还小
+  lbClamp();
+  lbApply();
+}
+window.addEventListener('resize', () => {
+  if ($('#lb').classList.contains('show')) lbRefitIfFit();
+});
+if (typeof ResizeObserver !== 'undefined') {
+  const ro = new ResizeObserver(() => {
+    if (!$('#lb').classList.contains('show') || !lbView) return;
+    lbRefitIfFit();
+  });
+  const cv = $('#lbCanvas');
+  if (cv) ro.observe(cv);
+}
+
+// 图片全屏（只留画面，侧栏隐藏；Esc 或再点一次退出）
+async function toggleFullscreen() {
+  try {
+    if (document.fullscreenElement) await document.exitFullscreen();
+    else await $('#lbStage').requestFullscreen();
+  } catch {
+    toast('这个浏览器不支持全屏');
+  }
+}
+$('#lbFull').addEventListener('click', (e) => { e.stopPropagation(); toggleFullscreen(); });
+document.addEventListener('fullscreenchange', () => {
+  const b = $('#lbFull');
+  if (b) b.textContent = document.fullscreenElement ? '✕ 退出全屏' : '⛶ 全屏';
+  requestAnimationFrame(() => { if ($('#lb').classList.contains('show')) lbRefitIfFit(); });
+});
+$('#qualitySeg').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  setBigQuality(b.dataset.q);
+});
+
+// 单张临时看原图：只改当前这张，不改全局偏好，翻下一页自动回到预览
+$('#lbForceFull').addEventListener('click', (e) => {
+  e.stopPropagation();
+  const g = (window._shownGroups || [])[lbIndex];
+  const jpg = g && g.items.find((x) => x.kind === 'jpg');
+  const img = $('#lbStage').querySelector('img');
+  if (!jpg || !img) return;
+  e.target.style.display = 'none';
+  const nt = $('#qualityNote');
+  if (nt) nt.textContent = '原图加载中…（仅本张）';
+  img.src = '/api/media?rel=' + enc(jpg.rel);
+});
+$('#lbClose').addEventListener('click', () => closeLightbox());
+// 点背景关闭。两个保护：
+//  1) 刚拖拽过 → 无视（pointer capture 会把 click 目标变成 .stage，一拖就误关）
+//  2) 已放大时不靠点背景关闭 —— 放大后画布大片空白，极易误触，要关请用 Esc / ✕ / 后退键
+$('#lb').addEventListener('click', (e) => {
+  if (lbJustDragged()) return;
+  const t = e.target;
+  const isBg = t.id === 'lb' || t.id === 'lbCanvas' || (t.classList && t.classList.contains('stage'));
+  if (!isBg) return;
+  // 关键：不能看“现在的 scale” —— click 会先冒泡到 #lbStage 把图缩回适应屏幕，
+  // 等冒到 #lb 时 scale 已经是 fit 了，于是会误关。要看“点击发生时是不是放大状态”。
+  if (lbZoomedBeforeDbl) return;
+  if (lbView && lbView.scale > lbFitScale() + 1e-4) return;
+  closeLightbox();
+});
+$('#lbOpen').addEventListener('click', () => {
+  const groups = window._shownGroups || []; const g = groups[lbIndex]; if (!g) return;
+  fetch('/api/reveal?rel=' + enc(g.main.rel)).then(() => toast('已在资源管理器中定位'));
+});
+document.addEventListener('keydown', (e) => {
+  if ($('#lb').classList.contains('show')) {
+    if (e.key === 'Escape') { e.preventDefault(); closeLightbox(); return; }
+    if (e.key === 'f' || e.key === 'F') { e.preventDefault(); toggleFullscreen(); return; }
+    if (e.key === 'ArrowLeft') { e.preventDefault(); lbMove(-1); return; }
+    if (e.key === 'ArrowRight') { e.preventDefault(); lbMove(1); return; }
+    return;
+  }
+  if (e.key === 'Escape' && $('#detail').classList.contains('show')) closeDetail();
+});
+
+pull();
+setThumbMode(thumbMode);
+setThumbSize(thumbSize);
+// 页面一打开就清掉可能残留的暂停状态（上次放视频时关标签页留下的）
+fetch('/api/preview/resume', { method: 'POST' }).catch(() => {});
+</script>
+</body>
+</html>
