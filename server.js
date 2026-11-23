@@ -30,6 +30,8 @@ const HOST = process.env.HOST || '0.0.0.0';
 const CACHE_DIR = path.join(__dirname, 'cache');
 const PREV_DIR = path.join(CACHE_DIR, 'prev');
 const INDEX_FILE = path.join(CACHE_DIR, 'index.json');
+const PLAY_DIR = path.join(CACHE_DIR, 'play');
+const PLAY_CAP_BYTES = Number(process.env.PLAY_CAP_MB || 2048) * 1024 * 1024;
 const CACHE_VERSION = 3;
 const PREV_VERSION = 'v4';   // 缩略图算法版本，改了就重新生成
 const THUMB_MAX = 640;       // 缩略图最长边（px）
@@ -300,7 +302,7 @@ let previewPaused = false;
 let pauseTimer = null;
 const activeChildren = new Set();
 
-function pausePreviews(seconds = 30) {
+function pausePreviews(seconds = 12) {
   previewPaused = true;
   for (const p of activeChildren) { try { p.kill('SIGKILL'); } catch {} }
   clearTimeout(pauseTimer);
@@ -391,7 +393,7 @@ function jpegWidth(buf) {
  * - RAW：内外嵌 JPEG 预览，再统一缩到 640px（否则光是预览就能吃掉 14 GiB 缓存）
  * - HEIF / 视频：ffmpeg 直接抽帧缩小
  */
-async function makePreview(absFile, rel, signal = null) {
+async function makePreview(absFile, rel, signal = null, force = false) {
   const ext = extOf(absFile);
   const kind = kindOf(absFile);
   let st;
@@ -401,7 +403,8 @@ async function makePreview(absFile, rel, signal = null) {
 
   // 已有缓存
   try { await fsp.access(out); return { file: out, mime: 'image/jpeg' }; } catch {}
-  if (previewPaused) return null;   // 正在播放视频：不生成，避免抢 CPU/GPU
+  // 缓存命中在上面已经返回了；走到这里说明需要现场生成
+  if (previewPaused && !force) return null;   // 正在播放视频：不生成新的，避免抢 CPU/GPU
   if (prevJobs.has(key)) return prevJobs.get(key);
 
   const job = (async () => {
@@ -428,13 +431,15 @@ async function makePreview(absFile, rel, signal = null) {
 
     // 视频：优先 QSV 硬件解码抽帧（4K HEVC 用软件解会吃掉全核 CPU，正是“打开视频就卡”的元凶）
     if (kind === 'video') {
+      // 先试 1 秒处（避开开头的黑场），失败再试第 0 帧 —— 短片 / 一开头就是正片的素材靠这个兜底
       const attempts = [
-        { hw: ['-hwaccel', 'qsv'], vf: `hwdownload,format=p010le,${scaled},format=yuvj420p` },
-        { hw: ['-hwaccel', 'qsv'], vf: `hwdownload,format=nv12,${scaled},format=yuvj420p` },
-        { hw: [], vf: scaled },
+        { hw: ['-hwaccel', 'qsv'], ss: '1', vf: `hwdownload,format=p010le,${scaled},format=yuvj420p` },
+        { hw: ['-hwaccel', 'qsv'], ss: '1', vf: `hwdownload,format=nv12,${scaled},format=yuvj420p` },
+        { hw: [], ss: '1', vf: scaled },
+        { hw: [], ss: '0', vf: scaled },
       ];
       for (const at of attempts) {
-        const args = ['-hide_banner', '-loglevel', 'error', '-y', ...at.hw, '-ss', '1', '-i', absFile,
+        const args = ['-hide_banner', '-loglevel', 'error', '-y', ...at.hw, '-ss', at.ss, '-i', absFile,
           '-frames:v', '1', '-vf', at.vf, '-q:v', '5', tmp];
         try {
           await gateVideo(() => runFfmpeg(args, 30000, signal), signal);
@@ -522,6 +527,85 @@ async function makeBigPreview(absFile, rel, signal = null) {
   }
 
   return { file: absFile, mime: MIME[extOf(absFile)] || 'image/jpeg' };
+}
+
+/** 判断 MP4 是否 faststart（moov 在 mdat 之前）；不 faststart 的浏览器必须整份下载才能播 */
+async function isFaststart(abs) {
+  let fd;
+  try {
+    fd = fs.openSync(abs, 'r');
+    const buf = Buffer.alloc(4096);
+    const n = fs.readSync(fd, buf, 0, 4096, 0);
+    let off = 0;
+    while (off + 8 <= n) {
+      let size = buf.readUInt32BE(off);
+      const type = buf.toString('latin1', off + 4, off + 8);
+      if (type === 'moov') return true;
+      if (type === 'mdat') return false;
+      if (size === 1) {                       // 64 位长度
+        if (off + 16 > n) break;
+        size = Number(buf.readBigUInt64BE(off + 8));
+      }
+      if (!size || size < 8) break;
+      off += size;
+    }
+    return true;                              // 判断不了就按原文件处理
+  } catch { return true; }
+  finally { if (fd !== undefined) try { fs.closeSync(fd); } catch {} }
+}
+
+const playJobs = new Map();
+/** 把非 faststart 的视频 remux 一份到缓存（-c copy，不重编码，画质无损） */
+async function ensureFaststart(abs, rel) {
+  const st = await fsp.stat(abs);
+  const key = sha1(`${rel}|${st.size}|${Math.round(st.mtimeMs)}|fs`);
+  const out = path.join(PLAY_DIR, key + '.mp4');
+  try { await fsp.access(out); return out; } catch {}
+  if (playJobs.has(out)) return playJobs.get(out);
+
+  const job = (async () => {
+    await fsp.mkdir(PLAY_DIR, { recursive: true });
+    const tmp = out.replace(/.mp4$/, '.part.mp4');
+    try {
+      // -c copy：只重排容器，不重编码，速度约等于磁盘拷贝
+      await runFfmpeg(['-hide_banner', '-loglevel', 'error', '-y', '-i', abs,
+        '-c', 'copy', '-movflags', '+faststart', tmp], 20 * 60 * 1000);
+      await fsp.rename(tmp, out);
+      trimPlayCache();
+      return out;
+    } catch (e) {
+      try { await fsp.unlink(tmp); } catch {}
+      console.error('  faststart remux 失败:', rel, e.message.slice(0, 160));
+      return null;
+    }
+  })().finally(() => playJobs.delete(out));
+
+  playJobs.set(out, job);
+  return job;
+}
+
+/** 播放缓存超限时删最旧的 */
+async function trimPlayCache() {
+  try {
+    const names = await fsp.readdir(PLAY_DIR);
+    let total = 0;
+    const entries = [];
+    for (const n of names) {
+      if (n.endsWith('.part.mp4')) { try { await fsp.unlink(path.join(PLAY_DIR, n)); } catch {} continue; }
+      try {
+        const st = await fsp.stat(path.join(PLAY_DIR, n));
+        total += st.size;
+        entries.push({ p: path.join(PLAY_DIR, n), size: st.size, m: st.mtimeMs });
+      } catch {}
+    }
+    if (total <= PLAY_CAP_BYTES) return;
+    entries.sort((a, b) => a.m - b.m);
+    let over = total - PLAY_CAP_BYTES * 0.9;
+    for (const e of entries) {
+      if (over <= 0) break;
+      try { await fsp.unlink(e.p); over -= e.size; } catch {}
+    }
+  } catch {}
 }
 
 /** 缩略图缓存超限时，删最旧的（启动后、每次扫描后各跑一次） */
@@ -618,13 +702,15 @@ async function scanFolder(name) {
   folder.subdirs = [...subMap.values()].sort((a, b) => a.rel.localeCompare(b.rel));
   if (folder.tMin === Infinity) folder.tMin = 0;
 
-  // 封面：优先 JPG，其次 RAW/HEIF
+  // 封面：优先 JPG，其次 RAW/HEIF；**纯视频文件夹就用第一个视频的封面**
   const firstOf = (pred) => folder.fileList.find(([rel]) => pred(rel));
   const coverEntry =
     firstOf((rel) => kindOf(rel) === 'jpg' && !rel.includes('/')) ||
     firstOf((rel) => kindOf(rel) === 'jpg') ||
-    firstOf((rel) => isImageKind(kindOf(rel)));
+    firstOf((rel) => isImageKind(kindOf(rel))) ||
+    firstOf((rel) => kindOf(rel) === 'video');
   folder.cover = coverEntry ? coverEntry[0] : null;
+  folder.coverKind = coverEntry ? kindOf(coverEntry[0]) : null;
 
   // 抽样 EXIF（最多 3 张，只读文件头，很便宜）
   const samples = [];
@@ -778,9 +864,23 @@ function serveFile(req, res, abs, { immutable = false, download = false } = {}) 
 
   const range = req.headers.range;
   if (range && /^bytes=/.test(range)) {
-    const [s, e] = range.replace('bytes=', '').split('-');
-    let start = s ? parseInt(s, 10) : 0;
-    let end = e ? parseInt(e, 10) : st.size - 1;
+    // 只处理第一段（多段请求极少见）；关键是支持 **后缀范围 bytes=-N**（取文件最后 N 字节）
+    // 浏览器播放 moov 在末尾的 MP4 时，就是用 bytes=-N 去读索引的 —— 当成 0-N 会直接黑屏
+    const spec = range.replace('bytes=', '').split(',')[0].trim();
+    const m = /^(\d*)-(\d*)$/.exec(spec);
+    let start, end;
+    if (!m || (m[1] === '' && m[2] === '')) {
+      res.writeHead(416, { 'Content-Range': `bytes */${st.size}` });
+      return res.end();
+    }
+    if (m[1] === '') {                        // 后缀：最后 N 字节
+      const n = parseInt(m[2], 10);
+      start = Math.max(0, st.size - n);
+      end = st.size - 1;
+    } else {
+      start = parseInt(m[1], 10);
+      end = m[2] === '' ? st.size - 1 : parseInt(m[2], 10);
+    }
     if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= st.size) {
       res.writeHead(416, { 'Content-Range': `bytes */${st.size}` });
       return res.end();
@@ -835,7 +935,7 @@ async function handle(req, res) {
       folders: state.folders.map((f) => ({
         name: f.name, rel: f.rel, bytes: f.bytes, files: f.files,
         exts: f.exts, kinds: f.kinds, subdirs: f.subdirs,
-        tMin: f.tMin, tMax: f.tMax, cover: f.cover, exif: f.exif,
+        tMin: f.tMin, tMax: f.tMax, cover: f.cover, coverKind: f.coverKind, exif: f.exif,
       })),
     }, req);
   }
@@ -853,6 +953,24 @@ async function handle(req, res) {
     const abs = resolveRel(rel);
     if (!abs) return send(res, 400, 'bad path');
     return serveFile(req, res, abs);
+  }
+
+  // 视频播放：非 faststart 的自动 remux 一份（-c copy，无损），否则浏览器要整份下载才能播
+  if (p === '/api/play') {
+    const abs = resolveRel(rel);
+    if (!abs) return send(res, 400, 'bad path');
+    if (!VIDEO_EXT.has(extOf(abs))) return serveFile(req, res, abs);
+    // 默认直接给原文件：Range（含后缀范围）修好后，浏览器自己就能读末尾的 moov 播放
+    if (url.searchParams.get('remux') !== '1') return serveFile(req, res, abs);
+    try {
+      const st2 = await fsp.stat(abs);
+      if (st2.size > PLAY_CAP_BYTES) return serveFile(req, res, abs);   // 太大，别缓存
+      if (await isFaststart(abs)) return serveFile(req, res, abs);
+      const out = await ensureFaststart(abs, rel);
+      return serveFile(req, res, out || abs);
+    } catch {
+      return serveFile(req, res, abs);
+    }
   }
 
   // 下载原文件：带正确的 Content-Disposition，否则浏览器会把文件名当 “media”、没有扩展名
@@ -874,16 +992,14 @@ async function handle(req, res) {
   if (p === '/api/prev') {
     const abs = resolveRel(rel);
     if (!abs) return send(res, 400, 'bad path');
-    if (previewPaused) {
-      res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-store' });
-      return res.end(PLACEHOLDER('暂停'));
-    }
+    // 注意：暂停时也要能返回“已经生成好的”缩略图，否则整个相册全变占位图（曾经踩过）
     // 客户端走开（删掉 img.src / 关详情页 / 切文件夹）时，浏览器会取消请求，
     // 这里立刻 abort：排队中的任务丢弃、正在跑的 ffmpeg 直接 kill
     const ac = new AbortController();
     res.on('close', () => { if (!res.writableEnded) ac.abort(); });
     try {
-      const r = await makePreview(abs, rel, ac.signal);
+      const force = url.searchParams.get('force') === '1';
+      const r = await makePreview(abs, rel, ac.signal, force);
       if (ac.signal.aborted) return;
       if (!r) {
         res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=60' });
@@ -936,7 +1052,7 @@ async function handle(req, res) {
   }
 
   if (p === '/api/preview/pause') {
-    pausePreviews(Number(url.searchParams.get('t')) || 30);
+    pausePreviews(Number(url.searchParams.get('t')) || 12);
     return sendJson(res, { ok: true, paused: true }, req);
   }
   if (p === '/api/preview/resume') {

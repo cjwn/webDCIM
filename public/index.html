@@ -213,6 +213,15 @@
   ::-webkit-scrollbar{width:11px;height:11px}
   ::-webkit-scrollbar-thumb{background:#2a3342;border-radius:6px;border:3px solid var(--bg)}
   ::-webkit-scrollbar-thumb:hover{background:#38445a}
+
+  /* ---- 封面容器（带 ▶ 视频角标）：表格模式跟随 --cover，卡片墙模式铺满卡片 ---- */
+  .row .coverwrap{position:relative;width:var(--cover);height:var(--cover);flex:none;
+    overflow:hidden;border-radius:7px;background:var(--bg3)}
+  .row .coverwrap .cover{width:100%;height:100%;object-fit:cover;display:block;border-radius:0}
+  .row .coverwrap .vbadge{position:absolute;right:4px;bottom:2px;font-size:11px;color:#fff;
+    text-shadow:0 1px 3px #000;pointer-events:none;line-height:1}
+  body.sz-l .row .coverwrap,body.sz-xl .row .coverwrap{width:100%;height:var(--fcard);border-radius:8px}
+  body.sz-m .row .coverwrap,body.sz-s .row .coverwrap{width:var(--cover);height:var(--cover)}
 </style>
 </head>
 <body>
@@ -540,7 +549,8 @@ function render() {
       const samp = (f.exif || {}).sample || {};
       const sub = f.subdirs && f.subdirs.length ? `${f.subdirs.length} 个子文件夹` : '';
       const cover = (thumbMode === 'auto' && f.cover)
-        ? `<img class="cover" loading="lazy" src="/api/prev?rel=${enc(f.cover)}" alt="">`
+        ? `<div class="coverwrap"><img class="cover" loading="lazy" src="/api/prev?rel=${enc(f.cover)}" alt="">` +
+          (f.coverKind === 'video' ? '<span class="vbadge">▶</span>' : '') + '</div>'
         : `<div class="cover ph"><b>${f.name.slice(0, 4)}</b>${f.name.slice(5) || '&nbsp;'}</div>`;
       html.push(`<div class="row" data-rel="${f.rel.replace(/"/g, '&quot;')}">
         ${cover}
@@ -946,7 +956,7 @@ async function openLightbox(i, opts = {}) {
 
   if (isVideo) {
     const v = document.createElement('video');
-    v.src = '/api/media?rel=' + enc(g.videos[0]);
+    v.src = '/api/play?rel=' + enc(g.videos[0]);   // 非 faststart 的会在服务端无损 remux 一次
     v.controls = true; v.autoplay = true; v.playsInline = true;
     v.setAttribute('tabindex', '-1');   // 别抢焦点，否则左右方向键会被视频拿去快进
     canvasEl.appendChild(v);
@@ -958,7 +968,15 @@ async function openLightbox(i, opts = {}) {
       requestAnimationFrame(() => requestAnimationFrame(() => lbKeepOnly(null)));
     };
     v.addEventListener('loadeddata', vDone, { once: true });
-    v.addEventListener('error', vDone, { once: true });
+    v.addEventListener('error', () => {
+      vDone();
+      lbShowVideoError(g, v);
+    }, { once: true });
+    // 兜底：30 秒还没画面，也提示用户（半截文件、moov 损坏等）
+    const vTimeout = setTimeout(() => {
+      if (v.readyState < 2) { lbSpinner(false); lbLoading = false; lbShowVideoError(g, v); }
+    }, 30000);
+    v.addEventListener('loadeddata', () => clearTimeout(vTimeout), { once: true });
   } else {
     const img = document.createElement('img');
     img.dataset.pending = '1';
@@ -1152,6 +1170,36 @@ let lbApplyQueued = false;
 
 let lbLoading = false;
 function lbSpinner(on) { const el = $('#lbSpin'); if (el) el.classList.toggle('show', !!on); }
+
+/** 视频放不出来时给一个明确的提示（而不是一直黑屏） */
+function lbShowVideoError(g, video) {
+  const canvas = lbCanvas();
+  if (!canvas) return;
+  const old = $('#lbVErr'); if (old) old.remove();
+  const box = document.createElement('div');
+  box.id = 'lbVErr';
+  const code = video && video.error ? video.error.code : 0;
+  const reason = code === 4 ? '浏览器不支持这个视频的编码（H.264 4:2:2 10-bit 等专业格式都放不了）'
+    : code === 3 ? '视频文件解码失败（可能拷贝不完整）'
+    : code === 2 ? '读取视频时出错'
+    : '视频加载超时（文件很大或索引在末尾，可能还在后台转换）';
+  const rel = g && g.videos && g.videos[0] ? g.videos[0] : '';
+  box.style.cssText = 'position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:8;' +
+    'background:rgba(20,25,34,.94);border:1px solid var(--line);border-radius:12px;padding:18px 22px;' +
+    'max-width:min(420px,80vw);text-align:center;font-size:13px;line-height:1.7';
+  box.innerHTML = '<div style="font-size:15px;margin-bottom:6px">⚠ 无法在浏览器里播放</div>' +
+    '<div style="color:var(--fg2)">' + reason + '</div>' +
+    '<div style="color:var(--fg3);font-size:11.5px;margin-top:8px;word-break:break-all">' + (rel.split('/').pop() || '') + '</div>';
+  const bar = document.createElement('div');
+  bar.style.cssText = 'margin-top:14px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap';
+  const b1 = document.createElement('button'); b1.textContent = '📂 用本地播放器打开';
+  b1.addEventListener('click', (ev) => { ev.stopPropagation(); fetch('/api/reveal?rel=' + enc(rel)).then(() => toast('已在资源管理器中定位')); });
+  const b2 = document.createElement('button'); b2.textContent = '⬇ 下载';
+  b2.addEventListener('click', (ev) => { ev.stopPropagation(); location.href = '/api/download?rel=' + enc(rel); });
+  bar.appendChild(b1); bar.appendChild(b2);
+  box.appendChild(bar);
+  canvas.appendChild(box);
+}
 /** 清掉所有“还没加载完”的待换图片 */
 function lbDropPending() {
   const c = lbCanvas();
