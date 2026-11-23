@@ -110,7 +110,7 @@ async function tick() {
   } catch (e) {
     if (DRY) {
       // 服务没起也能看到格式
-      const fake = { urls: ['http://192.168.3.102:7788'], status: 'ready', totals: { bytes: 927316675954, folders: 114 } };
+      const fake = { urls: ['http://192.168.1.100:7788'], status: 'ready', totals: { bytes: 927316675954, folders: 114 } };
       const frame = buildFrame(fake);
       if (frame !== lastFrame) { console.log('（服务未启动）将要发送:', JSON.stringify(frame)); lastFrame = frame; }
       return;
