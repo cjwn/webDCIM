@@ -198,7 +198,8 @@
   #lb .side .kv{display:grid;grid-template-columns:64px 1fr;gap:6px 10px;font-size:12.5px;
     margin-top:16px;color:var(--fg2)}
   #lb .side .kv b{color:var(--fg3);font-weight:400}
-  #lb .side .kv span{color:var(--fg);word-break:break-all}
+  /* 只匹配直接子级，别覆盖 EXIF 内部 span 继承下来的灰色 */
+  #lb .side .kv > span{color:var(--fg);word-break:break-all}
   #lb .nav{position:absolute;top:50%;transform:translateY(-50%);width:46px;height:72px;
     background:rgba(20,25,34,.55);border:1px solid rgba(80,92,112,.55);font-size:22px;color:var(--fg2);
     display:flex;align-items:center;justify-content:center;border-radius:10px;
@@ -433,6 +434,8 @@ function toast(msg) {
 let STATE = { folders: [], totals: {}, status: 'idle', progress: {} };
 let sortKey = 'date', collapsedYears = new Set(), filter = 'all';
 let currentFolder = null, currentFiles = [], lbIndex = -1;
+// EXIF 是异步的：每次开灯箱递增一次，回调里比对，丢弃过期结果
+let lbExifToken = 0;
 let gridIO = null;              // 网格的懒加载观察器
 let gridWant = new Set();       // 当前想看（在视口附近）的卡片
 let gridActive = new Set();     // 正在下载的卡片
@@ -1151,8 +1154,12 @@ async function openLightbox(i, opts = {}) {
     ['类型', g.items.map((x) => x.ext.replace('.', '')).join(' + ')],
     ['路径', g.main.rel],
   ];
+  // 拍摄时间 / 尺寸 放在 kv 网格里（跟 大小/类型/路径 同级），排在 EXIF 下面。
+  // EXIF 是异步取的，先占位隐藏，取回来再填值显示，避免行数跳动。
   $('#lbInfo').innerHTML = info.map(([k, v]) => `<b>${k}</b><span>${v}</span>`).join('') +
-    `<b>EXIF</b><span id="lbExif" style="color:var(--fg2)">读取中…</span>`;
+    `<b>EXIF</b><span id="lbExif" style="color:var(--fg2);white-space:pre-line">读取中…</span>` +
+    `<b id="lbDateB" style="display:none">拍摄时间</b><span id="lbDate" style="display:none"></span>` +
+    `<b id="lbDimsB" style="display:none">尺寸</b><span id="lbDims" style="display:none"></span>`;
 
   // 下载走 /api/download：响应带 Content-Disposition，文件名和扩展名才正确
   const shown = g.items.find((x) => x.kind === 'jpg') || p;
@@ -1184,11 +1191,35 @@ async function openLightbox(i, opts = {}) {
     else if (location.hash !== url) history.pushState(st, '', url);
   }
 
+  const token = ++lbExifToken;
   fetch('/api/exif?rel=' + enc(p.rel)).then((r) => r.json()).then((d) => {
     const e = d.exif;
     const el = $('#lbExif'); if (!el) return;
+    // 期间可能已经切到别的照片/关掉了灯箱 → 丢弃这次结果，别写到新图上
+    if (lbExifToken !== token) return;
+    // 拍摄时间 / 尺寸：填进上面 kv 网格的两个占位行（有值才显示）
+    const kv = (id, idB, val) => {
+      const v = $('#' + id), b = $('#' + idB);
+      if (!v || !b) return;
+      if (!val) { v.style.display = 'none'; b.style.display = 'none'; return; }
+      v.textContent = val;
+      v.style.display = ''; b.style.display = '';
+    };
+    kv('lbDate', 'lbDateB', e && e.date);
+    kv('lbDims', 'lbDimsB', e && e.dims);
     if (!e) { el.textContent = '无'; return; }
-    el.textContent = [e.camera, e.lens, e.date, e.f, e.shutter, e.iso, e.focal, e.dims].filter(Boolean).join(' · ') || '无';
+    // 拍摄参数（f/快门/ISO/焦距）挤在同一行且不折行；其余各占一行
+    const expo = [e.focal, e.f, e.shutter, e.iso].filter(Boolean).join(' · ');
+    const lines = [e.camera, e.lens, expo].filter(Boolean);
+    el.textContent = '';
+    if (!lines.length) { el.textContent = '无'; return; }
+    lines.forEach((t, i) => {
+      if (i) el.appendChild(document.createTextNode('\n'));
+      const s = document.createElement('span');
+      s.textContent = t;
+      if (t === expo && expo) { s.style.whiteSpace = 'nowrap'; s.style.overflowWrap = 'normal'; s.style.wordBreak = 'keep-all'; }
+      el.appendChild(s);
+    });
   }).catch(() => {});
 }
 
@@ -1239,6 +1270,7 @@ function closeLightbox(updateHistory = true) {
   clearStage();                  // 先停掉视频/释放解码器
   $('#lb').classList.remove('show');
   lbIndex = -1;
+  lbExifToken++;                  // 作废在途的 EXIF 请求，别让它回来写已关闭的灯箱
   resumeThumbWork();
   if (!updateHistory) return;
   if (history.state && history.state.p) {
