@@ -41,7 +41,7 @@ const fmtSize = (b) => {
 async function pickPort() {
   const { SerialPort } = require('serialport');
   const list = await SerialPort.list();
-  const usable = list.filter((p) => !/蓝牙|Bluetooth/i.test(p.friendlyName || p.manufacturer || ''));
+  const usable = list.filter((p) => !/蓝牙|Bluetooth|debug-console/i.test((p.path || '') + ' ' + (p.friendlyName || '') + ' ' + (p.manufacturer || '')));
   if (WANT_COM) {
     const hit = list.find((p) => (p.path || '').toUpperCase() === WANT_COM.toUpperCase());
     if (!hit) throw new Error(`找不到串口 ${WANT_COM}，可用：${list.map((p) => p.path).join(', ') || '(无)'}`);

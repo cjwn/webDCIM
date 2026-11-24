@@ -32,9 +32,14 @@
   .hrow{display:flex;align-items:center;gap:18px;flex-wrap:wrap}
   h1{font-size:17px;margin:0;font-weight:650;letter-spacing:.3px}
   h1 .ico{margin-right:6px}
-  .root{color:var(--fg3);font-size:12px;font-family:Consolas,monospace}
-  .lan{color:var(--accent2);font-size:12px;font-family:Consolas,monospace;cursor:pointer;
-    border:1px dashed rgba(56,211,159,.35);border-radius:6px;padding:1px 7px;opacity:.85}
+  .root{color:var(--fg2);font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    cursor:pointer;border:1px solid var(--line);background:var(--bg2);border-radius:6px;
+    padding:3px 9px;display:inline-flex;align-items:center;gap:6px;max-width:420px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:.15s}
+  .root:hover{color:var(--fg);border-color:var(--accent);background:var(--bg3)}
+  .root.unset{color:var(--warn);border-color:rgba(255,180,84,.45)}
+  .lan{color:var(--accent2);font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;cursor:pointer;
+    border:1px dashed rgba(56,211,159,.35);border-radius:6px;padding:2px 8px;opacity:.85}
   .lan:hover{opacity:1;border-color:var(--accent2)}
   .stats{display:flex;gap:16px;margin-left:auto;flex-wrap:wrap}
   .stat{text-align:right}
@@ -210,6 +215,38 @@
     background:#1e2631;border:1px solid var(--line);padding:9px 16px;border-radius:9px;
     font-size:13px;opacity:0;transition:.25s;z-index:300;pointer-events:none}
   .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+  /* ---------- root switcher modal ---------- */
+  .modal-mask{position:fixed;inset:0;background:rgba(6,8,12,.72);backdrop-filter:blur(4px);
+    z-index:260;display:none;align-items:center;justify-content:center;padding:20px}
+  .modal-mask.show{display:flex}
+  .modal{width:100%;max-width:540px;background:var(--bg2);border:1px solid var(--line);
+    border-radius:12px;padding:18px 20px;box-shadow:0 20px 60px rgba(0,0,0,.55)}
+  .modal-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+  .modal-h h3{margin:0;font-size:15px}
+  .modal-row{display:flex;gap:8px;margin-bottom:10px}
+  .modal-row input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--fg);
+    border-radius:7px;padding:7px 11px;font:13px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;outline:none}
+  .modal-row input:focus{border-color:var(--accent)}
+  .btn-primary{background:var(--accent);border-color:var(--accent);color:#08111f;font-weight:600}
+  .btn-primary:hover{background:#6cb0ff;border-color:#6cb0ff}
+  .modal-err{color:var(--danger);font-size:12px;margin:0 0 10px;display:none}
+  .modal-note{color:var(--fg3);font-size:12px;margin:0 0 10px}
+  .recent-title{font-size:12px;color:var(--fg3);margin:14px 0 8px}
+  .recent-list{display:flex;flex-direction:column;gap:6px;max-height:240px;overflow:auto}
+  .recent-item{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:8px;
+    border:1px solid var(--line);background:var(--bg);cursor:pointer;transition:.15s}
+  .recent-item:hover{border-color:var(--accent);background:var(--bg3)}
+  .recent-item.cur{border-color:rgba(77,159,255,.55);background:rgba(77,159,255,.08)}
+  .recent-item .rp{flex:1;font:12.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg)}
+  .recent-item .rtag{font-size:10.5px;color:var(--accent);flex:none}
+  .recent-item .rdel{padding:2px 6px;font-size:12px;color:var(--fg3);background:transparent;border-color:transparent;flex:none}
+  .recent-item .rdel:hover{color:var(--danger);background:rgba(255,107,107,.12)}
+  .empty-card{max-width:460px;margin:48px auto;padding:24px;border-radius:12px;
+    border:1px solid var(--line);background:var(--bg2);text-align:center}
+  .empty-card p{margin:0 0 14px;color:var(--fg2);font-size:13.5px;line-height:1.6}
+  .empty-card .errtxt{color:var(--danger);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
   ::-webkit-scrollbar{width:11px;height:11px}
   ::-webkit-scrollbar-thumb{background:#2a3342;border-radius:6px;border:3px solid var(--bg)}
   ::-webkit-scrollbar-thumb:hover{background:#38445a}
@@ -220,7 +257,7 @@
 <header>
   <div class="hrow">
     <h1><span class="ico">📷</span>照片库总览</h1>
-    <span class="root" id="rootPath"></span>
+    <button class="root" id="rootPath" title="点击切换照片库目录">📂 选择目录…</button>
     <span class="lan" id="lanUrl" style="display:none" title="点击复制，手机/别的电脑用这个地址"></span>
     <div class="stats">
       <div class="stat"><b class="mono" id="tFolders">–</b><span>文件夹</span></div>
@@ -325,6 +362,30 @@
       ← → 上一张 / 下一张<br>
       单击 放大/缩小 ・ 双击 关闭 ・ 滚轮/双指缩放<br>
       Esc 关闭　　后退键 返回网格
+    </div>
+  </div>
+</div>
+
+<div class="modal-mask" id="rootModal">
+  <div class="modal">
+    <div class="modal-h">
+      <h3>📂 切换照片库目录</h3>
+      <button id="btnRootClose" style="padding:4px 9px">✕</button>
+    </div>
+    <div id="rootLocalControls">
+      <div class="modal-row">
+        <button id="btnRootPick" class="btn-primary" style="width:100%">📂 打开系统文件夹选择器…</button>
+      </div>
+      <div class="modal-row">
+        <input type="text" id="rootInput" placeholder="或直接粘贴路径，如 /Volumes/PhotoSSD/OUTPUT">
+        <button id="btnRootApply">切换</button>
+      </div>
+    </div>
+    <p class="modal-note" id="rootLanNote" style="display:none">局域网访问模式：可在下方常用目录间切换；如需添加新目录，请在主机电脑本机打开网页选择。</p>
+    <p class="modal-err" id="rootErr"></p>
+    <div id="rootRecentWrap" style="display:none">
+      <div class="recent-title">最近使用的目录</div>
+      <div class="recent-list" id="rootRecent"></div>
     </div>
   </div>
 </div>
@@ -446,9 +507,30 @@ async function pull() {
   }
 }
 
+function fileManagerName() {
+  if (STATE.platform === 'darwin') return '访达';
+  if (STATE.platform === 'win32') return '资源管理器';
+  return '文件管理器';
+}
+const escHtml = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
 function renderHeader() {
   const t = STATE.totals || {};
-  $('#rootPath').textContent = STATE.root || '';
+  const rp = $('#rootPath');
+  if (STATE.root) {
+    rp.textContent = '📂 ' + STATE.root;
+    rp.classList.remove('unset');
+    rp.title = STATE.root + '（点击切换目录）';
+    const base = STATE.root.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || STATE.root;
+    document.title = `照片库总览 · ${base}`;
+  } else {
+    rp.textContent = '📂 点击选择照片库目录…';
+    rp.classList.add('unset');
+    rp.title = '尚未设置照片库目录，点击选择';
+    document.title = '照片库总览';
+  }
+  const openBtn = $('#btnOpenFolder');
+  if (openBtn) openBtn.textContent = `📂 在${fileManagerName()}中打开`;
   const lanEl = $('#lanUrl');
   if (lanEl) {
     const lan = (STATE.urls || []).find((u) => /^http:\/\/(?!127\.|localhost)/.test(u));
@@ -552,13 +634,26 @@ function render() {
         <div class="badges">${badges.join('')}</div>
         <div class="cam">${cam ? cam.name : '<span style="color:var(--fg3)">—</span>'}
           ${samp.date ? `<small>${samp.date.slice(0, 10)}</small>` : ''}</div>
-        <button class="open" title="在资源管理器中打开">打开</button>
+        <button class="open" title="在${fileManagerName()}中打开">打开</button>
       </div>`);
     }
     html.push(`</div></section>`);
   }
 
-  if (!folders.length) {
+  if (!STATE.root) {
+    html.length = 0;
+    html.push(`<div class="empty-card">
+      <p>还没有指定照片库目录。<br>点击下方按钮选择本机文件夹或外接硬盘目录即可开始扫描。</p>
+      <button class="btn-primary" id="btnPickEmpty">📂 选择照片库目录</button>
+    </div>`);
+  } else if (STATE.status === 'error') {
+    html.length = 0;
+    html.push(`<div class="empty-card">
+      <p>当前目录无法读取：</p>
+      <p class="errtxt">${escHtml(STATE.error || '未知错误')}</p>
+      <button class="btn-primary" id="btnPickEmpty">📂 切换其他目录</button>
+    </div>`);
+  } else if (!folders.length) {
     html.push(`<div class="empty">${STATE.status === 'scanning' ? '扫描中…' : '没有匹配的文件夹'}</div>`);
   }
   $('#overview').innerHTML = html.join('');
@@ -567,6 +662,7 @@ function render() {
 
 // 事件委托：总览
 $('#overview').addEventListener('click', (e) => {
+  if (e.target.closest('#btnPickEmpty')) { openRootModal(); return; }
   const yh = e.target.closest('.year-h');
   if (yh) {
     const y = yh.parentElement.dataset.year;
@@ -580,7 +676,7 @@ $('#overview').addEventListener('click', (e) => {
   if (!row) return;
   if (e.target.closest('.open')) {
     e.stopPropagation();
-    fetch('/api/reveal?rel=' + enc(row.dataset.rel)).then(() => toast('已在资源管理器中打开'));
+    fetch('/api/reveal?rel=' + enc(row.dataset.rel)).then(() => toast(`已在${fileManagerName()}中打开`));
     return;
   }
   openFolder(row.dataset.rel);
@@ -825,7 +921,7 @@ $('#filterSeg').addEventListener('click', (e) => {
 
 $('#btnBack').addEventListener('click', () => closeDetail());
 $('#btnOpenFolder').addEventListener('click', () => {
-  if (currentFolder) fetch('/api/reveal?rel=' + enc(currentFolder.rel)).then(() => toast('已在资源管理器中打开'));
+  if (currentFolder) fetch('/api/reveal?rel=' + enc(currentFolder.rel)).then(() => toast(`已在${fileManagerName()}中打开`));
 });
 
 /** 关闭详情页；updateHistory=true 时会让浏览器地址栏也跟着回退 */
@@ -1586,9 +1682,135 @@ $('#lb').addEventListener('click', (e) => {
 });
 $('#lbOpen').addEventListener('click', () => {
   const groups = window._shownGroups || []; const g = groups[lbIndex]; if (!g) return;
-  fetch('/api/reveal?rel=' + enc(g.main.rel)).then(() => toast('已在资源管理器中定位'));
+  fetch('/api/reveal?rel=' + enc(g.main.rel)).then(() => toast(`已在${fileManagerName()}中定位`));
 });
+
+// ---------------------------------------------------------------- 目录切换弹窗
+function showRootErr(msg) {
+  const el = $('#rootErr');
+  el.textContent = msg || '';
+  el.style.display = msg ? 'block' : 'none';
+}
+
+function renderRecentRoots() {
+  const list = STATE.recent || [];
+  const wrap = $('#rootRecentWrap');
+  const box = $('#rootRecent');
+  if (!list.length) { wrap.style.display = 'none'; box.innerHTML = ''; return; }
+  wrap.style.display = '';
+  box.innerHTML = list.map((p) => {
+    const isCur = STATE.root && p === STATE.root;
+    const delBtn = STATE.isLocal ? `<button class="rdel" data-del="${escHtml(p)}" title="从历史记录移除">✕</button>` : '';
+    return `<div class="recent-item ${isCur ? 'cur' : ''}" data-path="${escHtml(p)}">
+      <span class="rp" title="${escHtml(p)}">${escHtml(p)}</span>
+      ${isCur ? '<span class="rtag">当前</span>' : ''}
+      ${delBtn}
+    </div>`;
+  }).join('');
+}
+
+function openRootModal() {
+  const local = STATE.isLocal !== false;
+  $('#rootLocalControls').style.display = local ? '' : 'none';
+  $('#rootLanNote').style.display = local ? 'none' : '';
+  const input = $('#rootInput');
+  input.value = STATE.root || '';
+  input.placeholder = STATE.platform === 'win32'
+    ? '或直接粘贴路径，如 E:\\OUTPUT'
+    : '或直接粘贴路径，如 /Volumes/PhotoSSD/OUTPUT';
+  showRootErr('');
+  renderRecentRoots();
+  $('#rootModal').classList.add('show');
+  if (local) setTimeout(() => { input.focus(); input.select(); }, 30);
+}
+
+function closeRootModal() {
+  $('#rootModal').classList.remove('show');
+}
+
+function afterRootSwitched(newRoot) {
+  closeRootModal();
+  if ($('#lb').classList.contains('show')) closeLightbox({ push: false });
+  if ($('#detail').classList.contains('show')) closeDetail({ push: false });
+  if (location.hash) history.replaceState(null, '', location.pathname + location.search);
+  toast('已切换到：' + newRoot);
+  pull();
+}
+
+async function switchRootTo(targetPath) {
+  const p = (targetPath || '').trim();
+  if (!p) { showRootErr('请输入目录路径'); return; }
+  showRootErr('');
+  const btn = $('#btnRootApply');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/root', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: p }),
+    });
+    const d = await r.json();
+    if (!d.ok) { showRootErr(d.error || '切换失败'); return; }
+    afterRootSwitched(d.root);
+  } catch (e) {
+    showRootErr('请求失败：' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$('#rootPath').addEventListener('click', openRootModal);
+$('#btnRootClose').addEventListener('click', closeRootModal);
+$('#rootModal').addEventListener('click', (e) => { if (e.target.id === 'rootModal') closeRootModal(); });
+$('#btnRootApply').addEventListener('click', () => switchRootTo($('#rootInput').value));
+$('#rootInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); switchRootTo($('#rootInput').value); } });
+
+$('#btnRootPick').addEventListener('click', async () => {
+  const btn = $('#btnRootPick');
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '请在系统窗口中选择文件夹…';
+  showRootErr('');
+  try {
+    const r = await fetch('/api/root/pick', { method: 'POST' });
+    const d = await r.json();
+    if (d.cancelled) return;
+    if (!d.ok) { showRootErr(d.error || '选择失败'); return; }
+    afterRootSwitched(d.root);
+  } catch (e) {
+    showRootErr('调用系统选择器失败：' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+});
+
+$('#rootRecent').addEventListener('click', async (e) => {
+  const del = e.target.closest('.rdel');
+  if (del) {
+    e.stopPropagation();
+    const p = del.dataset.del;
+    try {
+      const r = await fetch('/api/root/remove', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: p }),
+      });
+      const d = await r.json();
+      if (d.ok) { STATE.recent = d.recent || []; renderRecentRoots(); }
+    } catch {}
+    return;
+  }
+  const item = e.target.closest('.recent-item');
+  if (!item) return;
+  switchRootTo(item.dataset.path);
+});
+
 document.addEventListener('keydown', (e) => {
+  if ($('#rootModal').classList.contains('show')) {
+    if (e.key === 'Escape') { e.preventDefault(); closeRootModal(); }
+    return;
+  }
   if ($('#lb').classList.contains('show')) {
     if (e.key === 'Escape') { e.preventDefault(); closeLightbox(); return; }
     if (e.key === 'f' || e.key === 'F') { e.preventDefault(); toggleFullscreen(); return; }
