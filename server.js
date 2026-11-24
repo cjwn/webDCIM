@@ -22,14 +22,16 @@ const os = require('os');
 const { spawn } = require('child_process');
 
 // ---------------------------------------------------------------- 配置
-const ROOT = path.resolve(process.env.OUTPUT_ROOT || 'E:/OUTPUT');
+const IS_MAC = process.platform === 'darwin';
+const IS_WIN = process.platform === 'win32';
 const PORT = Number(process.env.PORT || 7788);
 // 默认监听所有网卡：本机用 localhost，局域网用 192.168.x.x 都能访问
-// （只想本机可用就启动前 set HOST=127.0.0.1）
+// （只想本机可用就启动前设置 HOST=127.0.0.1）
 const HOST = process.env.HOST || '0.0.0.0';
 const CACHE_DIR = path.join(__dirname, 'cache');
 const PREV_DIR = path.join(CACHE_DIR, 'prev');
-const INDEX_FILE = path.join(CACHE_DIR, 'index.json');
+const CONFIG_FILE = path.join(CACHE_DIR, 'config.json');
+const LEGACY_INDEX_FILE = path.join(CACHE_DIR, 'index.json');
 const PLAY_DIR = path.join(CACHE_DIR, 'play');
 const PLAY_CAP_BYTES = Number(process.env.PLAY_CAP_MB || 2048) * 1024 * 1024;
 const CACHE_VERSION = 3;
@@ -37,12 +39,18 @@ const PREV_VERSION = 'v4';   // 缩略图算法版本，改了就重新生成
 const THUMB_MAX = 640;       // 缩略图最长边（px）
 const PREV_CAP_BYTES = Number(process.env.PREV_CAP_MB || 2048) * 1024 * 1024;  // 缩略图缓存上限，默认 2 GiB
 const FFMPEG = process.env.FFMPEG || 'ffmpeg';
+const RECENT_MAX = 15;
+
+let ROOT = '';
+let recentRoots = [];
+let scanSeq = 0;
 
 const IMAGE_EXT = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tif', '.tiff', '.avif']);
 const RAW_EXT = new Set(['.rw2', '.cr3', '.cr2', '.arw', '.orf', '.nef', '.dng', '.raf', '.rwl', '.pef', '.srw', '.raw']);
 const HEIF_EXT = new Set(['.hif', '.heic', '.heif', '.h265']);
 const VIDEO_EXT = new Set(['.mov', '.mp4', '.avi', '.m4v', '.mkv', '.mts', '.m2ts', '.3gp', '.wmv']);
 const IGNORE_FILES = new Set(['.ds_store', 'thumbs.db', 'desktop.ini']);
+const isIgnoredName = (name) => !name || IGNORE_FILES.has(name.toLowerCase()) || name.startsWith('._');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8',
@@ -67,17 +75,128 @@ const kindOf = (p) => {
 };
 const sha1 = (s) => crypto.createHash('sha1').update(s).digest('hex');
 
-/** 列出可供局域网访问的地址（排掉 VMware/Hyper-V 这类虚拟网卡） */
+/** 列出可供局域网访问的地址（排掉虚拟网卡与隧道网卡） */
 function lanUrls() {
-  const out = [];
+  const entries = [];
   for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
-    if (/vmware|virtualbox|vethernet|loopback|wsl|tap|tun|hamachi|zerotier/i.test(name)) continue;
+    if (/vmware|virtualbox|vethernet|loopback|wsl|tap|tun|utun|awdl|llw|bridge|anpi|hamachi|zerotier|^ap\d|^lo\d/i.test(name)) continue;
     for (const a of addrs || []) {
       if (a.family !== 'IPv4' || a.internal) continue;
-      out.push(`http://${a.address}:${PORT}`);
+      if (a.address.startsWith('169.254.')) continue;
+      // Mac 的 en0/en1 或 Windows 的 Wi-Fi/以太网排在前面
+      const prio = /^(en0|en1|wlan|wi-fi|ethernet|以太网)/i.test(name) ? 0 : 1;
+      entries.push({ prio, url: `http://${a.address}:${PORT}` });
     }
   }
-  return out;
+  entries.sort((a, b) => a.prio - b.prio);
+  return entries.map((e) => e.url);
+}
+
+// ---------------------------------------------------------------- 目录配置与持久化
+const sameRoot = (a, b) => (IS_WIN ? a.toLowerCase() === b.toLowerCase() : a === b);
+const indexFileFor = (root) => path.join(CACHE_DIR, `index-${sha1(root).slice(0, 12)}.json`);
+
+function rememberRoot(dir) {
+  const abs = path.resolve(dir);
+  recentRoots = [abs, ...recentRoots.filter((r) => !sameRoot(r, abs))].slice(0, RECENT_MAX);
+}
+
+function loadConfigSync() {
+  try {
+    const raw = fs.readFileSync(CONFIG_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    if (Array.isArray(data.recent)) {
+      recentRoots = data.recent
+        .filter((x) => typeof x === 'string' && x.trim())
+        .map((x) => path.resolve(x))
+        .slice(0, RECENT_MAX);
+    }
+    return typeof data.root === 'string' && data.root.trim() ? path.resolve(data.root) : '';
+  } catch {
+    return '';
+  }
+}
+
+async function saveConfig() {
+  try {
+    await fsp.mkdir(CACHE_DIR, { recursive: true });
+    const tmp = CONFIG_FILE + '.tmp';
+    await fsp.writeFile(tmp, JSON.stringify({ root: ROOT, recent: recentRoots }, null, 2));
+    await fsp.rename(tmp, CONFIG_FILE);
+  } catch (e) {
+    console.error('配置写入失败:', e.message);
+  }
+}
+
+function initRoot() {
+  const savedRoot = loadConfigSync();
+  const cliRoot = process.argv.slice(2).find((a) => a && !a.startsWith('-'));
+  const envRoot = process.env.OUTPUT_ROOT;
+  const candidate = cliRoot || envRoot || savedRoot || (IS_WIN && fs.existsSync('E:/OUTPUT') ? 'E:/OUTPUT' : '');
+  if (candidate) {
+    ROOT = path.resolve(candidate);
+    try {
+      if (fs.statSync(ROOT).isDirectory()) rememberRoot(ROOT);
+    } catch {}
+  } else {
+    ROOT = '';
+  }
+}
+initRoot();
+
+function isLocalRequest(req) {
+  const ip = (req && req.socket && req.socket.remoteAddress) || '';
+  return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    req.on('data', (d) => {
+      total += d.length;
+      if (total > 64 * 1024) { reject(new Error('body too large')); req.destroy(); return; }
+      chunks.push(d);
+    });
+    req.on('end', () => {
+      if (!chunks.length) return resolve({});
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+      catch { reject(new Error('invalid json')); }
+    });
+    req.on('error', reject);
+  });
+}
+
+function pickNativeFolder() {
+  return new Promise((resolve) => {
+    let cmd, args;
+    if (IS_MAC) {
+      cmd = 'osascript';
+      args = ['-e', 'POSIX path of (choose folder with prompt "选择照片库目录")'];
+    } else if (IS_WIN) {
+      cmd = 'powershell';
+      args = [
+        '-NoProfile', '-STA', '-Command',
+        "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = '选择照片库目录'; if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.SelectedPath }",
+      ];
+    } else {
+      cmd = 'zenity';
+      args = ['--file-selection', '--directory', '--title=选择照片库目录'];
+    }
+    const p = spawn(cmd, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '', err = '';
+    p.stdout.on('data', (d) => { out += d.toString(); });
+    p.stderr.on('data', (d) => { err += d.toString(); });
+    p.on('error', (e) => resolve({ ok: false, error: `无法调用系统选择框: ${e.message}` }));
+    p.on('close', (code) => {
+      const picked = out.trim().replace(/[\\/]+$/, (m, off, str) => (off === 0 || (IS_WIN && off === 2 && str[1] === ':') ? m : ''));
+      if (code === 0 && picked) return resolve({ ok: true, path: picked });
+      if (code === 0 || /-128|User canceled|cancelled/i.test(err) || code === 1) {
+        return resolve({ ok: false, cancelled: true });
+      }
+      resolve({ ok: false, error: err.trim() || `选择器退出码 ${code}` });
+    });
+  });
 }
 
 // ---------------------------------------------------------------- 状态
@@ -429,13 +548,24 @@ async function makePreview(absFile, rel, signal = null, force = false) {
 
     const scaled = `scale=${THUMB_MAX}:${THUMB_MAX}:force_original_aspect_ratio=decrease`;
 
-    // 视频：优先 QSV 硬件解码抽帧（4K HEVC 用软件解会吃掉全核 CPU，正是“打开视频就卡”的元凶）
+    // 视频：优先硬件解码抽帧（Mac 用 VideoToolbox，Windows 用 Intel QSV，失败回退软件解码）
     if (kind === 'video') {
-      // 先试 1 秒处（避开开头的黑场），失败再试第 0 帧 —— 短片 / 一开头就是正片的素材靠这个兜底
+      // 硬件解码优先（Mac → VideoToolbox，Windows → Intel QSV，其它 → 软件）；
+      // 先试 1 秒处（避开开头黑场），取不到再试第 0 帧（短片 / 开头就是正片）
+      const hwAttempts = IS_MAC
+        ? [
+            { hw: ['-hwaccel', 'videotoolbox'], vf: scaled },
+            { hw: [], vf: scaled },
+          ]
+        : IS_WIN
+          ? [
+              { hw: ['-hwaccel', 'qsv'], vf: `hwdownload,format=p010le,${scaled},format=yuvj420p` },
+              { hw: ['-hwaccel', 'qsv'], vf: `hwdownload,format=nv12,${scaled},format=yuvj420p` },
+              { hw: [], vf: scaled },
+            ]
+          : [{ hw: [], vf: scaled }];
       const attempts = [
-        { hw: ['-hwaccel', 'qsv'], ss: '1', vf: `hwdownload,format=p010le,${scaled},format=yuvj420p` },
-        { hw: ['-hwaccel', 'qsv'], ss: '1', vf: `hwdownload,format=nv12,${scaled},format=yuvj420p` },
-        { hw: [], ss: '1', vf: scaled },
+        ...hwAttempts.map((a) => ({ ...a, ss: '1' })),
         { hw: [], ss: '0', vf: scaled },
       ];
       for (const at of attempts) {
@@ -649,27 +779,30 @@ async function readHead(file, bytes) {
   } catch { return null; } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch {} }
 }
 
-async function scanFolder(name) {
-  const absRoot = path.join(ROOT, name);
+async function scanFolder(name, rootDir = ROOT) {
+  const isRootLoose = name === '.';
+  const absRoot = isRootLoose ? rootDir : path.join(rootDir, name);
+  const displayName = isRootLoose ? (path.basename(rootDir) || rootDir) : name;
   const folder = {
-    name, rel: name, bytes: 0, files: 0,
+    name: displayName, rel: name, bytes: 0, files: 0,
     exts: {}, kinds: {}, subdirs: [], fileList: [],
     tMin: Infinity, tMax: 0, cover: null, exif: null,
   };
   const subMap = new Map();
   const imageCandidates = [];
 
-  async function walk(dir) {
+  async function walk(dir, recurse = true) {
     let ents;
     try { ents = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
     await Promise.all(ents.map(async (e) => {
+      if (e.name.startsWith('.')) return;
       const p = path.join(dir, e.name);
-      if (e.isDirectory()) return walk(p);
+      if (e.isDirectory()) return recurse ? walk(p, true) : undefined;
       if (!e.isFile()) return;
-      if (IGNORE_FILES.has(e.name.toLowerCase())) return;
+      if (isIgnoredName(e.name)) return;
       let st;
       try { st = await fsp.stat(p); } catch { return; }
-      const rel = path.relative(ROOT, p).split(path.sep).join('/');
+      const rel = path.relative(rootDir, p).split(path.sep).join('/');
       const ext = extOf(p);
       const kind = kindOf(p);
 
@@ -683,20 +816,22 @@ async function scanFolder(name) {
       if (st.mtimeMs > folder.tMax) folder.tMax = st.mtimeMs;
       folder.fileList.push([rel, st.size, Math.round(st.mtimeMs)]);
 
-      const dirRel = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
-      if (dirRel && dirRel !== name) {
-        // 真正的子文件夹（相对该文件夹的路径）
-        const sub = dirRel.slice(name.length + 1);
-        const a = subMap.get(sub) || { rel: sub, name: path.posix.basename(sub) || sub, bytes: 0, files: 0, kinds: {} };
-        a.bytes += st.size; a.files++;
-        const kk = (a.kinds[kind] ||= { n: 0, b: 0 }); kk.n++; kk.b += st.size;
-        subMap.set(sub, a);
+      if (!isRootLoose) {
+        const dirRel = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
+        if (dirRel && dirRel !== name) {
+          // 真正的子文件夹（相对该文件夹的路径）
+          const sub = dirRel.slice(name.length + 1);
+          const a = subMap.get(sub) || { rel: sub, name: path.posix.basename(sub) || sub, bytes: 0, files: 0, kinds: {} };
+          a.bytes += st.size; a.files++;
+          const kk = (a.kinds[kind] ||= { n: 0, b: 0 }); kk.n++; kk.b += st.size;
+          subMap.set(sub, a);
+        }
       }
       if (isImageKind(kind) && imageCandidates.length < 12) imageCandidates.push(p);
     }));
   }
 
-  await walk(absRoot);
+  await walk(absRoot, !isRootLoose);
 
   folder.fileList.sort((a, b) => a[0].localeCompare(b[0]));
   folder.subdirs = [...subMap.values()].sort((a, b) => a.rel.localeCompare(b.rel));
@@ -736,11 +871,21 @@ async function scanFolder(name) {
 }
 
 async function scanAll() {
+  if (!ROOT) {
+    state.root = '';
+    state.status = 'idle';
+    state.folders = [];
+    state.error = null;
+    return;
+  }
   if (state.status === 'scanning') return;
+  const seq = ++scanSeq;
+  const scanRoot = ROOT;
   // 有旧数据（缓存）时保留展示，逐个大文件夹原地替换；全新扫描则从空开始
-  const displayMap = new Map(state.folders.map((f) => [f.name, f]));
+  const displayMap = new Map(state.folders.map((f) => [f.rel, f]));
   const hadData = state.folders.length > 0;
 
+  state.root = scanRoot;
   state.status = 'scanning';
   state.error = null;
   state.errors = [];
@@ -751,13 +896,18 @@ async function scanAll() {
   state.rescanOfCache = hadData;
 
   let ents;
-  try { ents = await fsp.readdir(ROOT, { withFileTypes: true }); }
+  try { ents = await fsp.readdir(scanRoot, { withFileTypes: true }); }
   catch (e) {
+    if (seq !== scanSeq) return;
     state.status = 'error';
-    state.error = `无法读取 ${ROOT}: ${e.message}`;
+    state.error = `无法读取 ${scanRoot}: ${e.message}`;
     return;
   }
+  if (seq !== scanSeq) return;
+
   const dirs = ents.filter((e) => e.isDirectory() && !e.name.startsWith('.')).map((e) => e.name).sort();
+  const hasLooseFiles = ents.some((e) => e.isFile() && !e.name.startsWith('.') && !isIgnoredName(e.name));
+  if (hasLooseFiles) dirs.unshift('.');
   state.progress.total = dirs.length;
 
   const queue = [...dirs];
@@ -765,60 +915,100 @@ async function scanAll() {
   const concurrency = 4;
   await Promise.all(Array.from({ length: concurrency }, async () => {
     while (queue.length) {
+      if (seq !== scanSeq) return;
       const name = queue.shift();
-      state.progress.current = name;
+      state.progress.current = name === '.' ? (path.basename(scanRoot) || scanRoot) : name;
       try {
-        const f = await scanFolder(name);
-        fresh.set(name, f);
-        displayMap.set(name, f);
+        const f = await scanFolder(name, scanRoot);
+        if (seq !== scanSeq) return;
+        fresh.set(f.rel, f);
+        displayMap.set(f.rel, f);
         state.folders = [...displayMap.values()].sort((a, b) => a.name.localeCompare(b.name));
         state.progress.bytes = state.folders.reduce((a, x) => a + x.bytes, 0);
       } catch (e) {
+        if (seq !== scanSeq) return;
         state.errors.push({ name, error: String((e && e.message) || e) });
       }
       state.progress.done++;
     }
   }));
 
+  if (seq !== scanSeq) return;
   // 扫完了：只保留磁盘上确实存在的
   state.folders = [...fresh.values()].sort((a, b) => a.name.localeCompare(b.name));
   state.status = 'ready';
   state.fromCache = false;
   state.finishedAt = Date.now();
   state.elapsedMs = state.finishedAt - state.startedAt;
-  saveCache();
+  saveCache(scanRoot, state.folders, state.elapsedMs);
   trimPrevCache();
 }
 
 let saveTimer = null;
-function saveCache() {
+function saveCache(rootDir, folders, elapsedMs) {
+  if (!rootDir) return;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
     try {
       await fsp.mkdir(CACHE_DIR, { recursive: true });
+      const target = indexFileFor(rootDir);
       const payload = {
-        version: CACHE_VERSION, root: ROOT, builtAt: Date.now(),
-        elapsedMs: state.elapsedMs, folders: state.folders,
+        version: CACHE_VERSION, root: rootDir, builtAt: Date.now(),
+        elapsedMs, folders,
       };
-      const tmp = INDEX_FILE + '.tmp';
+      const tmp = target + '.tmp';
       await fsp.writeFile(tmp, JSON.stringify(payload));
-      await fsp.rename(tmp, INDEX_FILE);
+      await fsp.rename(tmp, target);
     } catch (e) { console.error('缓存写入失败:', e.message); }
   }, 500);
 }
 
-async function loadCache() {
-  try {
-    const raw = await fsp.readFile(INDEX_FILE, 'utf8');
-    const data = JSON.parse(raw);
-    if (data.version !== CACHE_VERSION || path.resolve(data.root) !== ROOT) return false;
-    state.folders = data.folders || [];
-    state.elapsedMs = data.elapsedMs || 0;
-    state.status = 'ready';
-    state.fromCache = true;
-    state.finishedAt = data.builtAt;
-    return true;
-  } catch { return false; }
+async function loadCache(rootDir = ROOT) {
+  if (!rootDir) return false;
+  for (const file of [indexFileFor(rootDir), LEGACY_INDEX_FILE]) {
+    try {
+      const raw = await fsp.readFile(file, 'utf8');
+      const data = JSON.parse(raw);
+      if (data.version !== CACHE_VERSION || !sameRoot(path.resolve(data.root), rootDir)) continue;
+      state.root = rootDir;
+      state.folders = data.folders || [];
+      state.elapsedMs = data.elapsedMs || 0;
+      state.status = 'ready';
+      state.fromCache = true;
+      state.finishedAt = data.builtAt;
+      return true;
+    } catch {}
+  }
+  return false;
+}
+
+async function switchRoot(newPath) {
+  const abs = path.resolve(String(newPath || '').trim());
+  let st;
+  try { st = await fsp.stat(abs); }
+  catch { throw new Error(`路径不存在或无法访问：${abs}`); }
+  if (!st.isDirectory()) throw new Error(`不是文件夹：${abs}`);
+
+  scanSeq++;
+  clearTimeout(saveTimer);
+  ROOT = abs;
+  rememberRoot(abs);
+  await saveConfig();
+
+  state.root = ROOT;
+  state.status = 'idle';
+  state.fromCache = false;
+  state.startedAt = 0;
+  state.finishedAt = 0;
+  state.elapsedMs = 0;
+  state.progress = { done: 0, total: 0, current: '', bytes: 0 };
+  state.folders = [];
+  state.errors = [];
+  state.error = null;
+
+  const loaded = await loadCache(ROOT);
+  setTimeout(scanAll, loaded ? 200 : 0);
+  return { ok: true, root: ROOT, loaded };
 }
 
 // ---------------------------------------------------------------- HTTP 工具
@@ -839,7 +1029,8 @@ function sendJson(res, obj, req) {
 }
 
 function resolveRel(rel) {
-  if (typeof rel !== 'string' || !rel) return null;
+  if (!ROOT || typeof rel !== 'string' || !rel) return null;
+  if (rel === '.') return ROOT;
   const abs = path.resolve(ROOT, rel);
   if (abs !== ROOT && !abs.startsWith(ROOT + path.sep)) return null;
   return abs;
@@ -928,6 +1119,10 @@ async function handle(req, res) {
     const t = totals();
     return sendJson(res, {
       root: ROOT, status: state.status, fromCache: state.fromCache,
+      error: state.error,
+      platform: process.platform,
+      isLocal: isLocalRequest(req),
+      recent: recentRoots,
       paused: previewPaused,
       urls: lanUrls(),
       startedAt: state.startedAt, finishedAt: state.finishedAt, elapsedMs: state.elapsedMs,
@@ -938,6 +1133,56 @@ async function handle(req, res) {
         tMin: f.tMin, tMax: f.tMax, cover: f.cover, coverKind: f.coverKind, exif: f.exif,
       })),
     }, req);
+  }
+
+  // 切换根目录（本机可任意指定；局域网设备仅允许在已有常用目录间切换）
+  if (p === '/api/root' && req.method === 'POST') {
+    try {
+      const body = await readJsonBody(req);
+      const target = String(body.path || url.searchParams.get('path') || '').trim();
+      if (!target) return sendJson(res, { ok: false, error: '路径不能为空' }, req);
+      const abs = path.resolve(target);
+      if (!isLocalRequest(req)) {
+        const allowed = recentRoots.some((r) => sameRoot(r, abs)) || (ROOT && sameRoot(ROOT, abs));
+        if (!allowed) return sendJson(res, { ok: false, error: '局域网访问仅支持切换已保存的常用目录' }, req);
+      }
+      const r = await switchRoot(abs);
+      return sendJson(res, r, req);
+    } catch (e) {
+      return sendJson(res, { ok: false, error: String((e && e.message) || e) }, req);
+    }
+  }
+
+  // 调用本机系统文件夹选择框（仅允许本机访问）
+  if (p === '/api/root/pick' && req.method === 'POST') {
+    if (!isLocalRequest(req)) {
+      return sendJson(res, { ok: false, error: '系统文件夹选择器仅支持本机访问' }, req);
+    }
+    const picked = await pickNativeFolder();
+    if (!picked.ok) return sendJson(res, picked, req);
+    try {
+      const r = await switchRoot(picked.path);
+      return sendJson(res, r, req);
+    } catch (e) {
+      return sendJson(res, { ok: false, error: String((e && e.message) || e) }, req);
+    }
+  }
+
+  // 从最近目录列表移除（仅允许本机访问）
+  if (p === '/api/root/remove' && req.method === 'POST') {
+    if (!isLocalRequest(req)) return sendJson(res, { ok: false, error: '仅本机可编辑常用目录' }, req);
+    try {
+      const body = await readJsonBody(req);
+      const target = String(body.path || '').trim();
+      if (target) {
+        const abs = path.resolve(target);
+        recentRoots = recentRoots.filter((r) => !sameRoot(r, abs));
+        await saveConfig();
+      }
+      return sendJson(res, { ok: true, recent: recentRoots }, req);
+    } catch (e) {
+      return sendJson(res, { ok: false, error: String((e && e.message) || e) }, req);
+    }
   }
 
   if (p === '/api/folder') {
@@ -1040,8 +1285,15 @@ async function handle(req, res) {
     try {
       let st = null;
       try { st = fs.statSync(abs); } catch {}
-      if (st && st.isDirectory()) spawn('explorer.exe', [abs], { detached: true, windowsHide: false }).unref();
-      else spawn('explorer.exe', ['/select,', abs], { detached: true, windowsHide: false }).unref();
+      const isDir = !!(st && st.isDirectory());
+      if (IS_MAC) {
+        spawn('open', isDir ? [abs] : ['-R', abs], { detached: true, stdio: 'ignore' }).unref();
+      } else if (IS_WIN) {
+        if (isDir) spawn('explorer.exe', [abs], { detached: true, windowsHide: false }).unref();
+        else spawn('explorer.exe', ['/select,', abs], { detached: true, windowsHide: false }).unref();
+      } else {
+        spawn('xdg-open', [isDir ? abs : path.dirname(abs)], { detached: true, stdio: 'ignore' }).unref();
+      }
       return sendJson(res, { ok: true }, req);
     } catch (e) { return sendJson(res, { ok: false, error: String(e.message) }, req); }
   }
@@ -1073,7 +1325,13 @@ async function handle(req, res) {
       }
     } catch {}
     let idx = 0;
-    try { idx = (await fsp.stat(INDEX_FILE)).size; } catch {}
+    try {
+      for (const n of await fsp.readdir(CACHE_DIR)) {
+        if (/^index.*\.json$/.test(n)) {
+          try { idx += (await fsp.stat(path.join(CACHE_DIR, n))).size; } catch {}
+        }
+      }
+    } catch {}
     return sendJson(res, { files, bytes, index: idx, cap: PREV_CAP_BYTES }, req);
   }
 
@@ -1085,7 +1343,7 @@ async function handle(req, res) {
   try { await fsp.mkdir(CACHE_DIR, { recursive: true }); } catch {}
   try { await fsp.writeFile(path.join(CACHE_DIR, 'server.pid'), String(process.pid)); } catch {}
   try { await fsp.writeFile(path.join(CACHE_DIR, 'port.txt'), String(PORT)); } catch {}
-  const loaded = await loadCache();
+  const loaded = await loadCache(ROOT);
 
   const server = http.createServer((req, res) => {
     handle(req, res).catch((e) => {
@@ -1098,14 +1356,15 @@ async function handle(req, res) {
     const lan = lanUrls();
     if (HOST === '0.0.0.0' && lan.length) {
       console.log('  局域网访问  →  ' + lan.join('\n                 '));
-      console.log('  （手机/别的电脑用上面的地址；被防火墙拦就用管理员运行「开放局域网.bat」）');
+      if (IS_WIN) console.log('  （手机/别的电脑用上面的地址；被防火墙拦就用管理员运行「开放局域网.bat」）');
+      else console.log('  （手机/别的电脑连同一 WiFi 后用上面的地址即可访问）');
     }
-    console.log(`  目录: ${ROOT}  (PID ${process.pid})`);
+    console.log(`  目录: ${ROOT || '（未选择，请在网页顶栏点击选择文件夹）'}  (PID ${process.pid})`);
     console.log(`  缩略图引擎: ${sharpLib ? 'sharp/libvips ' + sharpLib.versions.vips : 'ffmpeg（装 sharp 能快 3~5 倍：npm i sharp）'}`);
     console.log(`  CPU: ${CORES} 线程 → 并发 小图${LIGHT_N} / 大图${HEAVY_N}`);
     if (loaded) console.log(`  已加载缓存（${state.folders.length} 个文件夹），后台重新扫描中…`);
     console.log('  按 Ctrl+C 停止\n');
-    setTimeout(scanAll, loaded ? 400 : 0);
+    if (ROOT) setTimeout(scanAll, loaded ? 400 : 0);
     setTimeout(trimPrevCache, 3000);
     // 预热 ffmpeg：避免第一次生成缩略图时还要等杀软扫描进程（否则首次会多 1-2 秒）
     try { spawn(FFMPEG, ['-version'], { stdio: 'ignore', windowsHide: true }).unref(); } catch {}
