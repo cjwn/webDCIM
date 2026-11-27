@@ -632,6 +632,44 @@ function runRawDevMac(bin, absFile, outFile, ev, maxPx, shadow = 0, highlight = 
   });
 }
 
+/**
+ * 估算 dcraw 需要的提亮增益。
+ * dcraw 的 -W（关自动提亮）输出比相机内嵌 JPEG 暗 1~2 档，直接给用户看太暗。
+ * 做法：以「相机内嵌预览的平均亮度」为目标，除以「dcraw 中性渲染的平均亮度」，
+ * 得到一个倍数乘到 -b 上。按文件缓存，同一张图只算一次。
+ * 只在非 macOS 的 dcraw 兜底路径生效，不影响 macOS 的 CIRAWFilter。
+ */
+const rawGainCache = new Map();
+async function estimateRawGain(absFile, signal = null) {
+  let st;
+  try { st = await fsp.stat(absFile); } catch { return 1; }
+  const key = sha1(`${absFile}|${st.size}|${Math.round(st.mtimeMs)}`);
+  if (rawGainCache.has(key)) return rawGainCache.get(key);
+
+  let target = 0;
+  const emb = await extractEmbeddedJpeg(absFile);
+  if (emb && sharpLib) {
+    try { target = (await sharpLib(emb).greyscale().stats()).channels[0].mean || 0; } catch {}
+  }
+
+  let base = 0;
+  try {
+    const tiff = await runDcrawEmu(absFile, 0, 0, 0, 45000, signal, 1);
+    if (sharpLib) base = (await sharpLib(tiff).greyscale().stats()).channels[0].mean || 0;
+  } catch {}
+
+  // dcraw 的 -b 乘在“线性”数据上，经过 sRGB gamma 后输出均值是次线性的：
+  // 实测 out ≈ base * b^0.61，所以反推 b = (target/base)^(1/0.61)
+  let gain = 1;
+  if (base > 3 && target > 8) {
+    gain = Math.pow(target / base, 1 / 0.61);
+    gain = Math.min(10, Math.max(1, gain));
+  }
+  if (process.env.RAWDEV_DEBUG) console.error(`  [gain] target=${target.toFixed(1)} base=${base.toFixed(1)} gain=${gain.toFixed(2)}`);
+  rawGainCache.set(key, gain);
+  return gain;
+}
+
 /** 导出物理传感器 16-bit 线性 PPM（无白平衡、无色彩矩阵、无色调曲线：65535=真饱和死白，0=真黑电平死黑） */
 function dumpSensorPpm16(absFile, outPpm, timeoutMs = 30000, signal = null) {
   return new Promise((resolve, reject) => {
@@ -663,10 +701,11 @@ function dumpSensorPpm16(absFile, outPpm, timeoutMs = 30000, signal = null) {
   });
 }
 
-function runDcrawEmu(absFile, ev, shadow = 0, highlight = 0, timeoutMs = 45000, signal = null) {
+function runDcrawEmu(absFile, ev, shadow = 0, highlight = 0, timeoutMs = 45000, signal = null, gain = 1) {
   return new Promise((resolve, reject) => {
     const effEv = ev - highlight * 0.6;
-    const mult = Math.pow(2, effEv).toFixed(3);
+    // gain = 自动提亮倍数（估算自相机内嵌预览的亮度）
+    const mult = (Math.pow(2, effEv) * (gain || 1)).toFixed(3);
     // -h 半尺寸 -w 相机白平衡 -W 禁用自动提亮 -H 5(高光重建)/2(柔和过渡) -o 1 sRGB -T TIFF 输出到 stdout
     const args = ['-h', '-w', '-W', '-H', highlight > 0.001 ? '5' : '2', '-o', '1', '-b', mult];
     if (shadow > 0.001) {
@@ -710,7 +749,7 @@ async function makeRawDevPreview(absFile, rel, evRaw, shRaw = 0, hlRaw = 0, clip
   const clip = clipRaw === true || clipRaw === '1' || clipRaw === 1;
   const rawMaxNum = Number(maxRaw);
   const BIG_MAX = rawMaxNum === 0 ? 0 : Math.max(1024, Math.min(8192, Math.round(rawMaxNum || 2048)));
-  const key = sha1(`${rel}|${st.size}|${Math.round(st.mtimeMs)}|rawdev_v10|m${BIG_MAX}|ev${ev}|sh${sh}|hl${hl}|c${clip ? 1 : 0}`);
+  const key = sha1(`${rel}|${st.size}|${Math.round(st.mtimeMs)}|rawdev_v11|m${BIG_MAX}|ev${ev}|sh${sh}|hl${hl}|c${clip ? 1 : 0}`);
   const out = path.join(PREV_DIR, `${key}-ev.jpg`);
 
   try { await fsp.access(out); return { file: out, mime: 'image/jpeg' }; } catch {}
@@ -745,7 +784,8 @@ async function makeRawDevPreview(absFile, rel, evRaw, shRaw = 0, hlRaw = 0, clip
     // 方案 A 兜底：dcraw_emu（LibRaw）解码 TIFF -> sharp / ffmpeg 缩到 2048px JPEG
     try {
       const data = await gateRawDev(async () => {
-        const tiff = await runDcrawEmu(absFile, ev, sh, hl, 45000, signal);
+        const gain = await estimateRawGain(absFile, signal);
+        const tiff = await runDcrawEmu(absFile, ev, sh, hl, 45000, signal, gain);
         if (signal && signal.aborted) throw new Error('aborted');
         const fallbackMax = BIG_MAX || 4096;
         if (sharpLib) {
