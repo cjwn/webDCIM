@@ -39,6 +39,9 @@ const PREV_VERSION = 'v4';   // 缩略图算法版本，改了就重新生成
 const THUMB_MAX = 640;       // 缩略图最长边（px）
 const PREV_CAP_BYTES = Number(process.env.PREV_CAP_MB || 2048) * 1024 * 1024;  // 缩略图缓存上限，默认 2 GiB
 const FFMPEG = process.env.FFMPEG || 'ffmpeg';
+const DCRAW_EMU = process.env.DCRAW_EMU || (IS_MAC && fs.existsSync('/opt/homebrew/bin/dcraw_emu') ? '/opt/homebrew/bin/dcraw_emu' : 'dcraw_emu');
+const RAWDEV_SRC = path.join(__dirname, 'tools', 'rawdev.swift');
+const RAWDEV_BIN = path.join(CACHE_DIR, 'rawdev');
 const RECENT_MAX = 15;
 
 let ROOT = '';
@@ -199,6 +202,110 @@ function pickNativeFolder() {
   });
 }
 
+/** 把文件移入系统废纸篓 / 回收站（不永久删除） */
+function moveToTrash(absList) {
+  return new Promise((resolve, reject) => {
+    if (!absList.length) return resolve();
+    let cmd, args, env = process.env;
+    if (IS_MAC) {
+      if (fs.existsSync('/usr/bin/trash')) {
+        cmd = '/usr/bin/trash';
+        args = absList;
+      } else {
+        cmd = 'osascript';
+        args = [
+          '-e', 'on run argv',
+          '-e', 'repeat with p in argv',
+          '-e', 'set f to POSIX file (p as text) as alias',
+          '-e', 'tell application "Finder" to delete f',
+          '-e', 'end repeat',
+          '-e', 'end run',
+          '--', ...absList,
+        ];
+      }
+    } else if (IS_WIN) {
+      cmd = 'powershell';
+      args = [
+        '-NoProfile', '-Command',
+        "Add-Type -AssemblyName Microsoft.VisualBasic; $files = $env:TRASH_FILES | ConvertFrom-Json; foreach ($f in $files) { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($f, 'OnlyErrorDialogs', 'SendToRecycleBin') }",
+      ];
+      env = { ...process.env, TRASH_FILES: JSON.stringify(absList) };
+    } else {
+      cmd = 'gio';
+      args = ['trash', ...absList];
+    }
+    const p = spawn(cmd, args, { windowsHide: true, env, stdio: ['ignore', 'ignore', 'pipe'] });
+    let err = '';
+    p.stderr.on('data', (d) => { err += d.toString(); });
+    p.on('error', (e) => reject(new Error(`无法移入废纸篓: ${e.message}`)));
+    p.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(err.trim() || `移入废纸篓失败 (exit ${code})`));
+    });
+  });
+}
+
+function removeFilesFromState(relSet) {
+  let changed = false;
+  const keptFolders = [];
+  for (const folder of state.folders) {
+    const before = folder.fileList.length;
+    const nextList = folder.fileList.filter(([r]) => !relSet.has(r));
+    if (nextList.length === before) {
+      keptFolders.push(folder);
+      continue;
+    }
+    changed = true;
+    if (!nextList.length) continue;
+    folder.fileList = nextList;
+    folder.files = 0;
+    folder.bytes = 0;
+    folder.exts = {};
+    folder.kinds = {};
+    folder.tMin = Infinity;
+    folder.tMax = 0;
+    const subMap = new Map();
+    const isRootLoose = folder.rel === '.';
+    for (const [r, size, mt] of nextList) {
+      const ext = extOf(r);
+      const kind = kindOf(r);
+      folder.files++;
+      folder.bytes += size;
+      const ex = (folder.exts[ext] ||= { n: 0, b: 0 });
+      ex.n++; ex.b += size;
+      const kd = (folder.kinds[kind] ||= { n: 0, b: 0 });
+      kd.n++; kd.b += size;
+      if (mt < folder.tMin) folder.tMin = mt;
+      if (mt > folder.tMax) folder.tMax = mt;
+      if (!isRootLoose) {
+        const dirRel = r.includes('/') ? r.slice(0, r.lastIndexOf('/')) : '';
+        if (dirRel && dirRel !== folder.rel) {
+          const sub = dirRel.slice(folder.rel.length + 1);
+          const a = subMap.get(sub) || { rel: sub, name: path.posix.basename(sub) || sub, bytes: 0, files: 0, kinds: {} };
+          a.bytes += size; a.files++;
+          const kk = (a.kinds[kind] ||= { n: 0, b: 0 }); kk.n++; kk.b += size;
+          subMap.set(sub, a);
+        }
+      }
+    }
+    if (folder.tMin === Infinity) folder.tMin = 0;
+    folder.subdirs = [...subMap.values()].sort((a, b) => a.rel.localeCompare(b.rel));
+    const firstOf = (pred) => folder.fileList.find(([r]) => pred(r));
+    const coverEntry =
+      firstOf((r) => kindOf(r) === 'jpg' && !r.includes('/')) ||
+      firstOf((r) => kindOf(r) === 'jpg') ||
+      firstOf((r) => isImageKind(kindOf(r))) ||
+      firstOf((r) => kindOf(r) === 'video');
+    folder.cover = coverEntry ? coverEntry[0] : null;
+    folder.coverKind = coverEntry ? kindOf(coverEntry[0]) : null;
+    keptFolders.push(folder);
+  }
+  if (changed) {
+    state.folders = keptFolders;
+    saveCache(ROOT, state.folders, state.elapsedMs);
+  }
+}
+
 // ---------------------------------------------------------------- 状态
 const state = {
   root: ROOT,
@@ -292,18 +399,31 @@ function parseTiff(buf, base) {
   return out.make || out.model || out.date ? out : null;
 }
 
+const TIFF_II = Buffer.from([0x49, 0x49]);
+const TIFF_MM = Buffer.from([0x4d, 0x4d]);
+
 function exifFromBuffer(buf) {
   const found = [];
-  // 常见情况：JPEG APP1 的 "Exif\0\0" 后面就是 TIFF 头
+  // 常见情况：JPEG APP1 的 "Exif\0\0" 后面就是 TIFF 头，命中且含拍摄信息直接返回，避免扫完整个缓冲区
   const idx = buf.indexOf('Exif\0\0', 0, 'latin1');
   if (idx >= 0) {
-    try { const e = parseTiff(buf, idx + 6); if (e) found.push(e); } catch {}
+    try {
+      const e = parseTiff(buf, idx + 6);
+      if (e) {
+        if (e.date || e.fnumber || e.shutter || e.iso) return e;
+        found.push(e);
+      }
+    } catch {}
   }
-  // 兜底：扫所有 TIFF 头（CR3 的 CMT1/CMT2、ORF 的 IIRO、HEIF 的 Exif item…）后合并
-  for (let i = 0; i < buf.length - 8; i++) {
-    if (!((buf[i] === 0x49 && buf[i + 1] === 0x49) || (buf[i] === 0x4d && buf[i + 1] === 0x4d))) continue;
-    try { const e = parseTiff(buf, i); if (e) found.push(e); } catch {}
-    if (found.length > 8) break;
+  // 兜底：用 Buffer.indexOf（SIMD）定位 TIFF 头（CR3 的 CMT1/CMT2、ORF 的 IIRO、HEIF 的 Exif item…）
+  for (const sig of [TIFF_II, TIFF_MM]) {
+    let from = 0;
+    while (from < buf.length - 8 && found.length <= 8) {
+      const i = buf.indexOf(sig, from);
+      if (i < 0 || i >= buf.length - 8) break;
+      try { const e = parseTiff(buf, i); if (e) found.push(e); } catch {}
+      from = i + 2;
+    }
   }
   if (!found.length) return null;
   // 字段多的优先，补全缺失字段
@@ -314,6 +434,36 @@ function exifFromBuffer(buf) {
     }
   }
   return merged;
+}
+
+const exifCache = new Map();
+const EXIF_CACHE_MAX = 2000;
+
+async function readExifForFile(abs) {
+  const kind = kindOf(abs);
+  if (kind === 'video' || kind === 'other') return null;
+  let st;
+  try { st = await fsp.stat(abs); } catch { return null; }
+  const key = `${abs}|${st.size}|${Math.round(st.mtimeMs)}`;
+  if (exifCache.has(key)) {
+    const hit = exifCache.get(key);
+    exifCache.delete(key);
+    exifCache.set(key, hit);
+    return hit;
+  }
+  // 分级异步读取：JPG 绝大多数在前 64KB 内就有完整 EXIF；RAW/HEIF 先读 256KB，找不到再扩大
+  const sizes = kind === 'jpg' ? [64 * 1024, 512 * 1024] : [256 * 1024, 2 * 1024 * 1024];
+  let parsed = null;
+  for (const sz of sizes) {
+    const head = await readHead(abs, sz);
+    if (!head) break;
+    parsed = exifFromBuffer(head);
+    if (parsed || st.size <= sz) break;
+  }
+  const result = prettyExif(parsed);
+  exifCache.set(key, result);
+  if (exifCache.size > EXIF_CACHE_MAX) exifCache.delete(exifCache.keys().next().value);
+  return result;
 }
 
 function prettyExif(e) {
@@ -338,31 +488,21 @@ function prettyExif(e) {
 const JPEG_SOI = Buffer.from([0xFF, 0xD8, 0xFF]);
 const JPEG_EOI = Buffer.from([0xFF, 0xD9]);
 
-function extractEmbeddedJpeg(file, headBytes = 3 * 1024 * 1024) {
-  let fd;
-  try {
-    fd = fs.openSync(file, 'r');
-    const st = fs.fstatSync(fd);
-    const len = Math.min(st.size, headBytes);
-    const buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, 0);
-    // 用 Buffer.indexOf（V8 的 SIMD memchr）替逐字节扫描，快 5~10 倍
-    let best = null, from = 0;
-    for (;;) {
-      const start = buf.indexOf(JPEG_SOI, from);
-      if (start < 0) break;
-      const end = buf.indexOf(JPEG_EOI, start + 3);
-      if (end < 0) break;                      // 预览被截断（文件头不够长）
-      const size = end + 2 - start;
-      if (size > 3000 && (!best || size > best.size)) best = { start, size };
-      from = start + 3;
-    }
-    return best ? Buffer.from(buf.subarray(best.start, best.start + best.size)) : null;
-  } catch {
-    return null;
-  } finally {
-    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+async function extractEmbeddedJpeg(file, headBytes = 3 * 1024 * 1024) {
+  const buf = await readHead(file, headBytes);
+  if (!buf) return null;
+  // 用 Buffer.indexOf（V8 的 SIMD memchr）替逐字节扫描，快 5~10 倍
+  let best = null, from = 0;
+  for (;;) {
+    const start = buf.indexOf(JPEG_SOI, from);
+    if (start < 0) break;
+    const end = buf.indexOf(JPEG_EOI, start + 3);
+    if (end < 0) break;                      // 预览被截断（文件头不够长）
+    const size = end + 2 - start;
+    if (size > 3000 && (!best || size > best.size)) best = { start, size };
+    from = start + 3;
   }
+  return best ? Buffer.from(buf.subarray(best.start, best.start + best.size)) : null;
 }
 
 // 简单并发闸门（支持 AbortSignal：客户端走开后排队中的任务直接丢弃）
@@ -396,6 +536,7 @@ const ffmpegGate = limiter(3);
 const gateLight = limiter(LIGHT_N);
 const gateHeavy = limiter(HEAVY_N);
 const gateVideo = limiter(1);   // 视频抽帧最贵，一次只跑一个
+const gateRawDev = limiter(1);  // RAW 显影提亮按需触发，一次只跑一个
 const gateFor = (size) => (size > 20 * 1024 * 1024 ? gateHeavy : gateLight);
 
 // sharp(libvips) 可选：装了就用它缩图（不起子进程、快 3~5 倍、内存低），没装回退 ffmpeg
@@ -431,6 +572,216 @@ function resumePreviews() {
   previewPaused = false;
   clearTimeout(pauseTimer);
   pauseTimer = null;
+}
+
+let rawDevBuildPromise = null;
+async function ensureMacRawDevBin() {
+  if (!IS_MAC) return null;
+  if (!fs.existsSync(RAWDEV_SRC)) return null;
+  try {
+    const [srcSt, binSt] = await Promise.all([fsp.stat(RAWDEV_SRC), fsp.stat(RAWDEV_BIN).catch(() => null)]);
+    if (binSt && binSt.mtimeMs >= srcSt.mtimeMs) return RAWDEV_BIN;
+  } catch { return null; }
+  if (rawDevBuildPromise) return rawDevBuildPromise;
+  rawDevBuildPromise = (async () => {
+    try {
+      await fsp.mkdir(CACHE_DIR, { recursive: true });
+      await new Promise((resolve, reject) => {
+        let err = '';
+        const p = spawn('swiftc', ['-O', RAWDEV_SRC, '-o', RAWDEV_BIN], { stdio: ['ignore', 'ignore', 'pipe'] });
+        p.stderr.on('data', (d) => { err += d.toString(); });
+        p.on('error', reject);
+        p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(err.slice(-200) || `swiftc exit ${code}`))));
+      });
+      return RAWDEV_BIN;
+    } catch (e) {
+      console.error('  rawdev.swift 编译失败（将回退 dcraw_emu）:', e.message);
+      return null;
+    } finally {
+      rawDevBuildPromise = null;
+    }
+  })();
+  return rawDevBuildPromise;
+}
+
+function runRawDevMac(bin, absFile, outFile, ev, maxPx, shadow = 0, highlight = 0, clipPpmPath = '', timeoutMs = 45000, signal = null) {
+  return new Promise((resolve, reject) => {
+    let stderr = '';
+    const args = [absFile, outFile, String(ev), String(maxPx), String(shadow), String(highlight)];
+    if (clipPpmPath) args.push(clipPpmPath);
+    const p = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    activeChildren.add(p);
+    const onAbort = () => { try { p.kill('SIGKILL'); } catch {} reject(new Error('aborted')); };
+    if (signal) {
+      if (signal.aborted) { try { p.kill('SIGKILL'); } catch {} return reject(new Error('aborted')); }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    const t = setTimeout(() => { try { p.kill(); } catch {} reject(new Error('rawdev timeout')); }, timeoutMs);
+    const done = () => { clearTimeout(t); activeChildren.delete(p); if (signal) signal.removeEventListener('abort', onAbort); };
+    p.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > 4000) stderr = stderr.slice(-2000); });
+    p.on('error', (e) => { done(); reject(e); });
+    p.on('close', (code) => {
+      done();
+      code === 0 ? resolve() : reject(new Error(`rawdev exit ${code}: ${stderr.slice(-200)}`));
+    });
+  });
+}
+
+/** 导出物理传感器 16-bit 线性 PPM（无白平衡、无色彩矩阵、无色调曲线：65535=真饱和死白，0=真黑电平死黑） */
+function dumpSensorPpm16(absFile, outPpm, timeoutMs = 30000, signal = null) {
+  return new Promise((resolve, reject) => {
+    const args = ['-h', '-4', '-H', '0', '-r', '1', '1', '1', '1', '-o', '0', '-Z', '-', absFile];
+    const p = spawn(DCRAW_EMU, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const ws = fs.createWriteStream(outPpm);
+    activeChildren.add(p);
+    let err = '';
+    const cleanup = () => { clearTimeout(t); activeChildren.delete(p); if (signal) signal.removeEventListener('abort', onAbort); };
+    const onAbort = () => { try { p.kill('SIGKILL'); } catch {} try { ws.destroy(); } catch {} reject(new Error('aborted')); };
+    if (signal) {
+      if (signal.aborted) { try { p.kill('SIGKILL'); } catch {} try { ws.destroy(); } catch {} return reject(new Error('aborted')); }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    const t = setTimeout(() => { try { p.kill(); } catch {} try { ws.destroy(); } catch {} reject(new Error('dcraw sensor timeout')); }, timeoutMs);
+    p.stdout.pipe(ws);
+    p.stderr.on('data', (d) => { err += d.toString(); if (err.length > 2000) err = err.slice(-1000); });
+    p.on('error', (e) => { cleanup(); try { ws.destroy(); } catch {} reject(e); });
+    ws.on('error', (e) => { cleanup(); try { p.kill('SIGKILL'); } catch {} reject(e); });
+    let exitCode = null, wsDone = false;
+    const maybeFinish = () => {
+      if (exitCode === null || !wsDone) return;
+      cleanup();
+      if (exitCode === 0) resolve(outPpm);
+      else reject(new Error(`dcraw sensor exit ${exitCode}: ${err.slice(-200)}`));
+    };
+    p.on('close', (code) => { exitCode = code; maybeFinish(); });
+    ws.on('finish', () => { wsDone = true; maybeFinish(); });
+  });
+}
+
+function runDcrawEmu(absFile, ev, shadow = 0, highlight = 0, timeoutMs = 45000, signal = null) {
+  return new Promise((resolve, reject) => {
+    const effEv = ev - highlight * 0.6;
+    const mult = Math.pow(2, effEv).toFixed(3);
+    // -h 半尺寸 -w 相机白平衡 -W 禁用自动提亮 -H 5(高光重建)/2(柔和过渡) -o 1 sRGB -T TIFF 输出到 stdout
+    const args = ['-h', '-w', '-W', '-H', highlight > 0.001 ? '5' : '2', '-o', '1', '-b', mult];
+    if (shadow > 0.001) {
+      // 在 16-bit 线性转 sRGB gamma 时加大暗部斜率，提亮暗部同时保住高光
+      const gPow = (2.222 + shadow * 0.85).toFixed(3);
+      const gToe = (4.5 + shadow * 14).toFixed(2);
+      args.push('-g', gPow, gToe);
+    }
+    args.push('-T', '-Z', '-', absFile);
+    const p = spawn(DCRAW_EMU, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    activeChildren.add(p);
+    const chunks = [];
+    let err = '';
+    const onAbort = () => { try { p.kill('SIGKILL'); } catch {} reject(new Error('aborted')); };
+    if (signal) {
+      if (signal.aborted) { try { p.kill('SIGKILL'); } catch {} return reject(new Error('aborted')); }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    const t = setTimeout(() => { try { p.kill(); } catch {} reject(new Error('dcraw_emu timeout')); }, timeoutMs);
+    const done = () => { clearTimeout(t); activeChildren.delete(p); if (signal) signal.removeEventListener('abort', onAbort); };
+    p.stdout.on('data', (d) => chunks.push(d));
+    p.stderr.on('data', (d) => { err += d.toString(); if (err.length > 4000) err = err.slice(-2000); });
+    p.on('error', (e) => { done(); reject(e); });
+    p.on('close', (code) => {
+      done();
+      if (code === 0 && chunks.length) resolve(Buffer.concat(chunks));
+      else reject(new Error(`dcraw_emu exit ${code}: ${err.slice(-200)}`));
+    });
+  });
+}
+
+const rawDevJobs = new Map();
+/** RAW 曝光补偿 / 暗部提亮 / 高光压暗 / 线性溢出检测预览（ev: -4~+4, sh: 0~1, hl: 0~1, clip: 0|1） */
+async function makeRawDevPreview(absFile, rel, evRaw, shRaw = 0, hlRaw = 0, clipRaw = false, maxRaw = 2048, signal = null) {
+  if (kindOf(absFile) !== 'raw') return null;
+  let st;
+  try { st = await fsp.stat(absFile); } catch { return null; }
+  const ev = Math.max(-4, Math.min(4, Math.round(Number(evRaw) * 2) / 2 || 0));
+  const sh = Math.max(0, Math.min(1, Math.round(Number(shRaw) * 20) / 20 || 0));
+  const hl = Math.max(0, Math.min(1, Math.round(Number(hlRaw) * 20) / 20 || 0));
+  const clip = clipRaw === true || clipRaw === '1' || clipRaw === 1;
+  const rawMaxNum = Number(maxRaw);
+  const BIG_MAX = rawMaxNum === 0 ? 0 : Math.max(1024, Math.min(8192, Math.round(rawMaxNum || 2048)));
+  const key = sha1(`${rel}|${st.size}|${Math.round(st.mtimeMs)}|rawdev_v10|m${BIG_MAX}|ev${ev}|sh${sh}|hl${hl}|c${clip ? 1 : 0}`);
+  const out = path.join(PREV_DIR, `${key}-ev.jpg`);
+
+  try { await fsp.access(out); return { file: out, mime: 'image/jpeg' }; } catch {}
+  if (rawDevJobs.has(key)) return rawDevJobs.get(key);
+
+  const job = (async () => {
+    await fsp.mkdir(PREV_DIR, { recursive: true });
+    const tmp = out.replace(/\.jpg$/, '.part.jpg');
+
+    // 方案 B：macOS 原生 CIRAWFilter + CIHighlightShadowAdjust + 物理传感器 16-bit 溢出检测
+    if (IS_MAC) {
+      const bin = await ensureMacRawDevBin();
+      if (bin) {
+        const tmpPpm = clip ? out.replace(/\.jpg$/, '.part.ppm') : '';
+        try {
+          await gateRawDev(async () => {
+            if (tmpPpm) await dumpSensorPpm16(absFile, tmpPpm, 30000, signal);
+            await runRawDevMac(bin, absFile, tmp, ev, BIG_MAX, sh, hl, tmpPpm, 45000, signal);
+          }, signal);
+          await fsp.rename(tmp, out);
+          return { file: out, mime: 'image/jpeg' };
+        } catch (e) {
+          try { await fsp.unlink(tmp); } catch {}
+          if (signal && signal.aborted) throw e;
+          // 某些新机身系统不支持时静默回退到 dcraw_emu
+        } finally {
+          if (tmpPpm) try { await fsp.unlink(tmpPpm); } catch {}
+        }
+      }
+    }
+
+    // 方案 A 兜底：dcraw_emu（LibRaw）解码 TIFF -> sharp / ffmpeg 缩到 2048px JPEG
+    try {
+      const data = await gateRawDev(async () => {
+        const tiff = await runDcrawEmu(absFile, ev, sh, hl, 45000, signal);
+        if (signal && signal.aborted) throw new Error('aborted');
+        const fallbackMax = BIG_MAX || 4096;
+        if (sharpLib) {
+          return sharpThumb(tiff, fallbackMax).catch(() => ffmpegScaleBuffer(tiff, fallbackMax, signal));
+        }
+        return ffmpegScaleBuffer(tiff, fallbackMax, signal);
+      }, signal);
+      await fsp.writeFile(tmp, data);
+      await fsp.rename(tmp, out);
+      return { file: out, mime: 'image/jpeg' };
+    } catch (e) {
+      try { await fsp.unlink(tmp); } catch {}
+      if (signal && signal.aborted) throw e;
+      return null;
+    }
+  })().finally(() => rawDevJobs.delete(key));
+
+  rawDevJobs.set(key, job);
+  return job;
+}
+
+function runSipsToJpeg(absFile, outFile, maxPx, timeoutMs = 30000, signal = null) {
+  return new Promise((resolve, reject) => {
+    let stderr = '';
+    const args = ['-s', 'format', 'jpeg', '-s', 'formatOptions', '82', '-Z', String(maxPx), absFile, '--out', outFile];
+    const p = spawn('/usr/bin/sips', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    activeChildren.add(p);
+    const onAbort = () => { try { p.kill('SIGKILL'); } catch {} reject(new Error('aborted')); };
+    if (signal) {
+      if (signal.aborted) { try { p.kill('SIGKILL'); } catch {} return reject(new Error('aborted')); }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    const t = setTimeout(() => { try { p.kill(); } catch {} reject(new Error('sips timeout')); }, timeoutMs);
+    const done = () => { clearTimeout(t); activeChildren.delete(p); if (signal) signal.removeEventListener('abort', onAbort); };
+    p.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > 4000) stderr = stderr.slice(-2000); });
+    p.on('error', (e) => { done(); reject(e); });
+    p.on('close', (code) => {
+      done();
+      code === 0 ? resolve() : reject(new Error(`sips exit ${code}: ${stderr.slice(-200)}`));
+    });
+  });
 }
 
 function runFfmpeg(args, timeoutMs = 30000, signal = null) {
@@ -532,8 +883,22 @@ async function makePreview(absFile, rel, signal = null, force = false) {
     const tmp = out.replace(/\.jpg$/, '.part.jpg');
 
     if (kind === 'raw') {
-      const buf = extractEmbeddedJpeg(absFile);
-      if (!buf) return null;
+      const buf = await extractEmbeddedJpeg(absFile);
+      if (!buf) {
+        // 佳能 HDR PQ 模式下拍摄的 CR3 内嵌的是 HEVC 预览而非 JPEG：macOS 用原生 sips 兜底
+        if (IS_MAC) {
+          try {
+            await gateFor(st.size)(() => runSipsToJpeg(absFile, tmp, THUMB_MAX, 30000, signal), signal);
+            try { await fsp.unlink(out); } catch {}
+            await fsp.rename(tmp, out);
+            return { file: out, mime: 'image/jpeg' };
+          } catch (e) {
+            try { await fsp.unlink(tmp); } catch {}
+            if (signal && signal.aborted) throw e;
+          }
+        }
+        return null;
+      }
       const gate = gateFor(buf.length);
       let data = buf;
       if (jpegWidth(buf) > THUMB_MAX) {
@@ -582,6 +947,19 @@ async function makePreview(absFile, rel, signal = null, force = false) {
       return null;
     }
 
+    // macOS 上 HEIF/HIF 优先用系统自带 sips（原生 ImageIO 支持 10-bit / tiled HIF 与 HDR 色彩映射）
+    if (IS_MAC && kind === 'heif') {
+      try {
+        await gateFor(st.size)(() => runSipsToJpeg(absFile, tmp, THUMB_MAX, 30000, signal), signal);
+        try { await fsp.unlink(out); } catch {}
+        await fsp.rename(tmp, out);
+        return { file: out, mime: 'image/jpeg' };
+      } catch (e) {
+        try { await fsp.unlink(tmp); } catch {}
+        if (signal && signal.aborted) throw e;
+      }
+    }
+
     // JPG：优先 sharp（快得多、不起进程）
     if (sharpLib && kind === 'jpg') {
       try {
@@ -606,7 +984,7 @@ async function makePreview(absFile, rel, signal = null, force = false) {
     } catch {
       try { await fsp.unlink(tmp); } catch {}
       if (kind === 'jpg') return { file: absFile, mime: MIME[ext] || 'image/jpeg' };   // 缩不了就发原图
-      const buf = extractEmbeddedJpeg(absFile, 1024 * 1024);
+      const buf = await extractEmbeddedJpeg(absFile, 1024 * 1024);
       if (buf) { await fsp.writeFile(tmp, buf); await fsp.rename(tmp, out); return { file: out, mime: 'image/jpeg' }; }
       return null;
     }
@@ -616,8 +994,36 @@ async function makePreview(absFile, rel, signal = null, force = false) {
   return job;
 }
 
+// RAW 大图内嵌预览的小容量内存 LRU（前后翻页秒切，不反复读盘 12MB）
+const rawBigCache = new Map();
+const RAW_BIG_MAX_ITEMS = 8;
+const RAW_BIG_MAX_BYTES = 48 * 1024 * 1024;
+let rawBigCacheBytes = 0;
+
+function getRawBigCache(key) {
+  if (!rawBigCache.has(key)) return null;
+  const buf = rawBigCache.get(key);
+  rawBigCache.delete(key);
+  rawBigCache.set(key, buf);
+  return buf;
+}
+function setRawBigCache(key, buf) {
+  if (!buf || buf.length > RAW_BIG_MAX_BYTES / 2) return;
+  if (rawBigCache.has(key)) {
+    rawBigCacheBytes -= rawBigCache.get(key).length;
+    rawBigCache.delete(key);
+  }
+  rawBigCache.set(key, buf);
+  rawBigCacheBytes += buf.length;
+  while (rawBigCache.size > RAW_BIG_MAX_ITEMS || rawBigCacheBytes > RAW_BIG_MAX_BYTES) {
+    const oldestKey = rawBigCache.keys().next().value;
+    rawBigCacheBytes -= rawBigCache.get(oldestKey).length;
+    rawBigCache.delete(oldestKey);
+  }
+}
+
 /** 大图预览（看大图用）
- *  - RAW：直接抽内嵌全尺寸 JPEG，不落盘
+ *  - RAW：异步抽内嵌全尺寸 JPEG，内存 LRU 缓存，不落盘
  *  - 超大 JPG/PNG：降采样到 2048px 并缓存（局域网/弱 WiFi 下关键，否则一张原图 52MB）
  *  - 其它：原图（想强制原图加 ?full=1）
  */
@@ -627,8 +1033,35 @@ async function makeBigPreview(absFile, rel, signal = null) {
   try { st = await fsp.stat(absFile); } catch { return null; }
 
   if (kind === 'raw') {
-    const buf = extractEmbeddedJpeg(absFile, 12 * 1024 * 1024);
-    return buf ? { buffer: buf, mime: 'image/jpeg' } : null;
+    const key = `${absFile}|${st.size}|${Math.round(st.mtimeMs)}`;
+    const cached = getRawBigCache(key);
+    if (cached) return { buffer: cached, mime: 'image/jpeg' };
+    const buf = await extractEmbeddedJpeg(absFile, 12 * 1024 * 1024);
+    if (buf) {
+      setRawBigCache(key, buf);
+      return { buffer: buf, mime: 'image/jpeg' };
+    }
+    // 抽不到内嵌 JPEG（如佳能 HDR PQ CR3）：macOS 用原生 sips 渲染并缓存到 prev
+    if (IS_MAC) {
+      const BIG_MAX = 2048;
+      const fkey = sha1(`${rel}|${st.size}|${Math.round(st.mtimeMs)}|big${BIG_MAX}`);
+      const out = path.join(PREV_DIR, fkey + '-big.jpg');
+      try {
+        await fsp.access(out);
+        return { file: out, mime: 'image/jpeg' };
+      } catch {
+        await fsp.mkdir(PREV_DIR, { recursive: true });
+        const tmp = out.replace(/\.jpg$/, '.part.jpg');
+        try {
+          await gateFor(st.size)(() => runSipsToJpeg(absFile, tmp, BIG_MAX, 30000, signal), signal);
+          await fsp.rename(tmp, out);
+          return { file: out, mime: 'image/jpeg' };
+        } catch {
+          try { await fsp.unlink(tmp); } catch {}
+        }
+      }
+    }
+    return null;
   }
 
   const BIG_MAX = 2048;
@@ -642,6 +1075,11 @@ async function makeBigPreview(absFile, rel, signal = null) {
       await fsp.mkdir(PREV_DIR, { recursive: true });
       const tmp = out.replace(/\.jpg$/, '.part.jpg');
       try {
+        if (IS_MAC && kind === 'heif') {
+          await gateFor(st.size)(() => runSipsToJpeg(absFile, tmp, BIG_MAX, 30000, signal), signal);
+          await fsp.rename(tmp, out);
+          return { file: out, mime: 'image/jpeg' };
+        }
         const buf = sharpLib && kind === 'jpg'
           ? await gateFor(st.size)(() => sharpThumb(absFile, BIG_MAX), signal).catch(() => null)
           : null;
@@ -769,14 +1207,16 @@ async function trimPrevCache() {
 const isImageKind = (k) => k === 'jpg' || k === 'raw' || k === 'heif';
 
 async function readHead(file, bytes) {
-  let fd;
+  let fh;
   try {
-    fd = fs.openSync(file, 'r');
-    const len = Math.min(fs.fstatSync(fd).size, bytes);
-    const buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, 0);
-    return buf;
-  } catch { return null; } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch {} }
+    fh = await fsp.open(file, 'r');
+    const st = await fh.stat();
+    const len = Math.min(st.size, bytes);
+    if (len <= 0) return Buffer.alloc(0);
+    const buf = Buffer.allocUnsafe(len);
+    const { bytesRead } = await fh.read(buf, 0, len, 0);
+    return bytesRead === len ? buf : buf.subarray(0, bytesRead);
+  } catch { return null; } finally { if (fh) try { await fh.close(); } catch {} }
 }
 
 async function scanFolder(name, rootDir = ROOT) {
@@ -854,10 +1294,8 @@ async function scanFolder(name, rootDir = ROOT) {
     const pick = [imgs[0], imgs[Math.floor(imgs.length / 2)], imgs[imgs.length - 1]];
     for (const p of pick) {
       if (!p) continue;
-      const head = await readHead(p, 512 * 1024);
-      if (!head) continue;
-      const e = exifFromBuffer(head);
-      if (e) samples.push(prettyExif(e));
+      const e = await readExifForFile(p);
+      if (e) samples.push(e);
     }
   }
   const cams = {};
@@ -1016,15 +1454,15 @@ function send(res, code, body, headers = {}) {
   res.writeHead(code, { 'Cache-Control': 'no-store', ...headers });
   res.end(body);
 }
-function sendJson(res, obj, req) {
+function sendJson(res, obj, req, cacheControl = 'no-store') {
   const buf = Buffer.from(JSON.stringify(obj));
   const accept = req?.headers['accept-encoding'] || '';
   if (accept.includes('gzip') && buf.length > 2048) {
     const gz = zlib.gzipSync(buf, { level: 6 });
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip', 'Content-Length': gz.length, 'Cache-Control': 'no-store' });
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip', 'Content-Length': gz.length, 'Cache-Control': cacheControl });
     return res.end(gz);
   }
-  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': buf.length, 'Cache-Control': 'no-store' });
+  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': buf.length, 'Cache-Control': cacheControl });
   res.end(buf);
 }
 
@@ -1036,9 +1474,9 @@ function resolveRel(rel) {
   return abs;
 }
 
-function serveFile(req, res, abs, { immutable = false, download = false } = {}) {
+async function serveFile(req, res, abs, { immutable = false, download = false } = {}) {
   let st;
-  try { st = fs.statSync(abs); } catch { return send(res, 404, 'not found'); }
+  try { st = await fsp.stat(abs); } catch { return send(res, 404, 'not found'); }
   if (!st.isFile()) return send(res, 404, 'not a file');
 
   const etag = `W/"${st.size.toString(16)}-${Math.round(st.mtimeMs).toString(16)}"`;
@@ -1052,6 +1490,12 @@ function serveFile(req, res, abs, { immutable = false, download = false } = {}) 
   if (download) headers['Content-Disposition'] = `attachment; filename*=UTF-8''${encodeURIComponent(path.basename(abs))}`;
 
   if (req.headers['if-none-match'] === etag) return send(res, 304, '', headers);
+
+  const pipeStream = (stream) => {
+    res.on('close', () => { if (!stream.destroyed) stream.destroy(); });
+    stream.on('error', () => { try { res.end(); } catch {} });
+    stream.pipe(res);
+  };
 
   const range = req.headers.range;
   if (range && /^bytes=/.test(range)) {
@@ -1080,13 +1524,13 @@ function serveFile(req, res, abs, { immutable = false, download = false } = {}) 
     headers['Content-Range'] = `bytes ${start}-${end}/${st.size}`;
     headers['Content-Length'] = end - start + 1;
     res.writeHead(206, headers);
-    return fs.createReadStream(abs, { start, end }).pipe(res);
+    return pipeStream(fs.createReadStream(abs, { start, end }));
   }
 
   headers['Content-Length'] = st.size;
   res.writeHead(200, headers);
   if (req.method === 'HEAD') return res.end();
-  fs.createReadStream(abs).pipe(res);
+  pipeStream(fs.createReadStream(abs));
 }
 
 const PLACEHOLDER = (label) => Buffer.from(
@@ -1228,9 +1672,8 @@ async function handle(req, res) {
   if (p === '/api/exif') {
     const abs = resolveRel(rel);
     if (!abs) return send(res, 400, 'bad path');
-    const head = await readHead(abs, 4 * 1024 * 1024);
-    if (!head) return sendJson(res, { exif: null }, req);
-    return sendJson(res, { exif: prettyExif(exifFromBuffer(head)) }, req);
+    const exif = await readExifForFile(abs);
+    return sendJson(res, { exif }, req, 'public, max-age=86400');
   }
 
   // 缩略图（最长边 640px，统一缓存）
@@ -1255,6 +1698,30 @@ async function handle(req, res) {
       if (ac.signal.aborted) return;
       res.writeHead(200, { 'Content-Type': 'image/svg+xml' });
       return res.end(PLACEHOLDER('ERR'));
+    }
+  }
+
+  // RAW 曝光/暗部/高光预览（按需解码，支持 ?ev=-4..4&sh=0..1&hl=0..1，macOS 优先 CIRAWFilter，兜底 dcraw_emu）
+  if (p === '/api/rawdev') {
+    const abs = resolveRel(rel);
+    if (!abs) return send(res, 400, 'bad path');
+    if (kindOf(abs) !== 'raw') return send(res, 400, 'not a raw file');
+    const ev = Number(url.searchParams.get('ev') || 0);
+    const sh = Number(url.searchParams.get('sh') || 0);
+    const hl = Number(url.searchParams.get('hl') || 0);
+    const clip = url.searchParams.get('clip') === '1';
+    const maxParam = url.searchParams.get('max');
+    const maxPx = maxParam === '0' ? 0 : Number(maxParam || 2048);
+    const ac = new AbortController();
+    res.on('close', () => { if (!res.writableEnded) ac.abort(); });
+    try {
+      const r = await makeRawDevPreview(abs, rel, ev, sh, hl, clip, maxPx, ac.signal);
+      if (ac.signal.aborted) return;
+      if (!r) return send(res, 422, 'raw develop failed');
+      return serveFile(req, res, r.file, { immutable: false });
+    } catch {
+      if (ac.signal.aborted) return;
+      return send(res, 422, 'raw develop failed');
     }
   }
 
@@ -1296,6 +1763,42 @@ async function handle(req, res) {
       }
       return sendJson(res, { ok: true }, req);
     } catch (e) { return sendJson(res, { ok: false, error: String(e.message) }, req); }
+  }
+
+  // 移入系统废纸篓 / 回收站（仅允许本机访问，不永久删除）
+  if (p === '/api/delete' && req.method === 'POST') {
+    if (!isLocalRequest(req)) {
+      return sendJson(res, { ok: false, error: '仅允许本机执行删除操作' }, req);
+    }
+    try {
+      const body = await readJsonBody(req);
+      const rawRels = Array.isArray(body.rels) ? body.rels : (body.rel ? [body.rel] : []);
+      const rels = [...new Set(rawRels.filter((x) => typeof x === 'string' && x.trim()))];
+      if (!rels.length) return sendJson(res, { ok: false, error: '未指定要删除的文件' }, req);
+      const targets = [];
+      for (const r of rels) {
+        const abs = resolveRel(r);
+        if (!abs || abs === ROOT) return sendJson(res, { ok: false, error: `非法路径：${r}` }, req);
+        let st;
+        try { st = await fsp.stat(abs); } catch { continue; }
+        if (!st.isFile()) return sendJson(res, { ok: false, error: `只能删除文件：${r}` }, req);
+        targets.push({ rel: r, abs });
+      }
+      if (!targets.length) return sendJson(res, { ok: false, error: '文件已不存在' }, req);
+      await moveToTrash(targets.map((t) => t.abs));
+      const deletedSet = new Set(targets.map((t) => t.rel));
+      removeFilesFromState(deletedSet);
+      for (const t of targets) {
+        for (const k of exifCache.keys()) if (k.startsWith(t.abs + '|')) exifCache.delete(k);
+        for (const k of rawBigCache.keys()) if (k.startsWith(t.abs + '|')) {
+          rawBigCacheBytes -= rawBigCache.get(k).length;
+          rawBigCache.delete(k);
+        }
+      }
+      return sendJson(res, { ok: true, deleted: targets.map((t) => t.rel) }, req);
+    } catch (e) {
+      return sendJson(res, { ok: false, error: String((e && e.message) || e) }, req);
+    }
   }
 
   if (p === '/api/rescan') {
