@@ -39,7 +39,12 @@ const PREV_VERSION = 'v4';   // 缩略图算法版本，改了就重新生成
 const THUMB_MAX = 640;       // 缩略图最长边（px）
 const PREV_CAP_BYTES = Number(process.env.PREV_CAP_MB || 2048) * 1024 * 1024;  // 缩略图缓存上限，默认 2 GiB
 const FFMPEG = process.env.FFMPEG || 'ffmpeg';
-const DCRAW_EMU = process.env.DCRAW_EMU || (IS_MAC && fs.existsSync('/opt/homebrew/bin/dcraw_emu') ? '/opt/homebrew/bin/dcraw_emu' : 'dcraw_emu');
+// dcraw_emu（LibRaw 自带命令行）：macOS 可用 brew 装；Windows 可以直接把
+// LibRaw 官方 Win64 包里的 dcraw_emu.exe + libraw.dll 放到 tools/libraw/ 下，会自动识别
+const BUNDLED_DCRAW = path.join(__dirname, 'tools', 'libraw', IS_WIN ? 'dcraw_emu.exe' : 'dcraw_emu');
+const DCRAW_EMU = process.env.DCRAW_EMU
+  || (fs.existsSync(BUNDLED_DCRAW) ? BUNDLED_DCRAW
+    : (IS_MAC && fs.existsSync('/opt/homebrew/bin/dcraw_emu') ? '/opt/homebrew/bin/dcraw_emu' : 'dcraw_emu'));
 const RAWDEV_SRC = path.join(__dirname, 'tools', 'rawdev.swift');
 const RAWDEV_BIN = path.join(CACHE_DIR, 'rawdev');
 const RECENT_MAX = 15;

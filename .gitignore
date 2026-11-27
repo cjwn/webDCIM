@@ -2,3 +2,7 @@ cache/
 node_modules/
 _backup/
 *.log
+
+# LibRaw 二进制（自行下载放入 tools/libraw/）
+tools/libraw/*.exe
+tools/libraw/*.dll
