@@ -6,12 +6,17 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "dev": "node --watch server.js",
+    "tray": "start-tray.bat",
+    "tray-ps": "powershell -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File tray.ps1 -OpenBrowser",
+    "build-tray": "tools\\build-tray.bat",
     "open-lan": "powershell -NoProfile -ExecutionPolicy Bypass -File open-lan.ps1",
     "oled": "node oled.js",
     "oled-test": "node oled.js --dry-run"
   },
   "optionalDependencies": {
-    "sharp": "^0.33.0",
-    "serialport": "^12.0.0"
+    "onnxruntime-node": "^1.31.1",
+    "serialport": "^12.0.0",
+    "sharp": "^0.33.0"
   }
 }

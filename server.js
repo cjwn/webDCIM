@@ -20,6 +20,9 @@ const crypto = require('crypto');
 const zlib = require('zlib');
 const os = require('os');
 const { spawn } = require('child_process');
+const { moveToTrash, ensureWinTrashBin } = require('./lib/trash');
+const { createRawDev } = require('./lib/rawdev');
+const { createSharpnessService } = require('./lib/sharpness');
 
 // ---------------------------------------------------------------- 配置
 const IS_MAC = process.platform === 'darwin';
@@ -83,6 +86,22 @@ const kindOf = (p) => {
 };
 const sha1 = (s) => crypto.createHash('sha1').update(s).digest('hex');
 
+function fmtLogBytes(b) {
+  if (!b || b < 1024) return `${b || 0} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KiB`;
+  if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MiB`;
+  return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+}
+
+function logOp(tag, msg, isErr = false) {
+  const d = new Date();
+  const p2 = (n) => String(n).padStart(2, '0');
+  const ts = `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
+  const line = `[${ts}] [${tag}] ${msg}`;
+  if (isErr) console.error(line);
+  else console.log(line);
+}
+
 /** 列出可供局域网访问的地址（排掉虚拟网卡与隧道网卡） */
 function lanUrls() {
   const entries = [];
@@ -103,6 +122,238 @@ function lanUrls() {
 // ---------------------------------------------------------------- 目录配置与持久化
 const sameRoot = (a, b) => (IS_WIN ? a.toLowerCase() === b.toLowerCase() : a === b);
 const indexFileFor = (root) => path.join(CACHE_DIR, `index-${sha1(root).slice(0, 12)}.json`);
+const favFileFor = (root) => {
+  const norm = IS_WIN ? path.resolve(root).toLowerCase() : path.resolve(root);
+  return path.join(CACHE_DIR, `favorites-${sha1(norm).slice(0, 12)}.json`);
+};
+const albumNamesFileFor = (root) => {
+  const norm = IS_WIN ? path.resolve(root).toLowerCase() : path.resolve(root);
+  return path.join(CACHE_DIR, `albums-${sha1(norm).slice(0, 12)}.json`);
+};
+const ALBUM_ALIAS_MAX_LEN = 80;
+const sanitizeAlbumAlias = (raw) => String(raw == null ? '' : raw).replace(/[\r\n\t]+/g, ' ').trim().slice(0, ALBUM_ALIAS_MAX_LEN);
+function isValidFolderRel(rel) {
+  if (!ROOT || typeof rel !== 'string') return false;
+  if (rel === '__favorites__') return false;
+  if (rel === '.') return true;
+  if (!rel || rel !== rel.trim() || rel.length > 1024 || rel.includes('\\') || rel.includes('\0') || rel.startsWith('/')) return false;
+  if (rel.split('/').some((seg) => !seg || seg === '.' || seg === '..')) return false;
+  return !!resolveRel(rel);
+}
+
+let albumNamesMap = new Map(); // folder rel -> custom album alias
+let albumNamesSaveChain = Promise.resolve();
+
+async function loadAlbumNames(rootDir = ROOT) {
+  albumNamesMap = new Map();
+  if (!rootDir) return;
+  try {
+    const raw = await fsp.readFile(albumNamesFileFor(rootDir), 'utf8');
+    const data = JSON.parse(raw);
+    if (data.root && !sameRoot(path.resolve(data.root), path.resolve(rootDir))) return;
+    const names = data && typeof data.names === 'object' && data.names && !Array.isArray(data.names) ? data.names : {};
+    for (const [rel, val] of Object.entries(names)) {
+      if (!rel || rel === '__favorites__' || rel.includes('\\') || rel.includes('\0') || rel.startsWith('/')) continue;
+      const alias = sanitizeAlbumAlias(val);
+      if (alias) albumNamesMap.set(rel, alias);
+    }
+  } catch {}
+}
+
+function saveAlbumNames(rootDir = ROOT) {
+  if (!rootDir) return Promise.resolve();
+  const target = albumNamesFileFor(rootDir);
+  const names = {};
+  for (const [rel, alias] of [...albumNamesMap.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    names[rel] = alias;
+  }
+  const payload = JSON.stringify({
+    version: 1,
+    root: rootDir,
+    updatedAt: Date.now(),
+    names,
+  }, null, 2);
+  const job = albumNamesSaveChain.then(async () => {
+    try {
+      await fsp.mkdir(CACHE_DIR, { recursive: true });
+      const tmp = target + '.tmp';
+      await fsp.writeFile(tmp, payload, 'utf8');
+      await fsp.rename(tmp, target);
+    } catch (e) {
+      console.error('相册名称写入失败:', e.message);
+    }
+  });
+  albumNamesSaveChain = job.catch(() => {});
+  return job;
+}
+const baseOfRel = (rel) => {
+  const s = String(rel || '').replace(/\\/g, '/');
+  const slash = s.lastIndexOf('/');
+  const dot = s.lastIndexOf('.');
+  return dot > slash ? s.slice(0, dot) : s;
+};
+function isValidFavBase(base) {
+  if (!ROOT || typeof base !== 'string') return false;
+  const s = base.trim();
+  if (!s || s !== base || s.length > 1024 || s.includes('\\') || s.includes('\0') || s.startsWith('/')) return false;
+  if (s.split('/').some((seg) => !seg || seg === '.' || seg === '..')) return false;
+  const abs = resolveRel(s);
+  return !!(abs && abs !== ROOT);
+}
+
+let favoritesMap = new Map(); // base (相对根目录、去扩展名、posix 斜杠) -> addedAt (ms)
+let favSaveChain = Promise.resolve();
+
+async function loadFavorites(rootDir = ROOT) {
+  favoritesMap = new Map();
+  if (!rootDir) return;
+  try {
+    const raw = await fsp.readFile(favFileFor(rootDir), 'utf8');
+    const data = JSON.parse(raw);
+    if (data.root && !sameRoot(path.resolve(data.root), path.resolve(rootDir))) return;
+    const list = Array.isArray(data.items) ? data.items : (Array.isArray(data) ? data : []);
+    const now = Date.now();
+    for (let i = 0; i < list.length; i++) {
+      const it = list[i];
+      const base = typeof it === 'string' ? it : (it && typeof it.base === 'string' ? it.base : '');
+      if (!base || base.includes('\\') || base.includes('\0') || base.startsWith('/')) continue;
+      const addedAt = (it && typeof it.addedAt === 'number' && Number.isFinite(it.addedAt)) ? it.addedAt : (now - i);
+      favoritesMap.set(base, addedAt);
+    }
+  } catch {}
+}
+
+function saveFavorites(rootDir = ROOT) {
+  if (!rootDir) return Promise.resolve();
+  const target = favFileFor(rootDir);
+  const items = [...favoritesMap.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([base, addedAt]) => ({ base, addedAt }));
+  const payload = JSON.stringify({
+    version: 1,
+    root: rootDir,
+    updatedAt: Date.now(),
+    items,
+  }, null, 2);
+  const job = favSaveChain.then(async () => {
+    try {
+      await fsp.mkdir(CACHE_DIR, { recursive: true });
+      const tmp = target + '.tmp';
+      await fsp.writeFile(tmp, payload, 'utf8');
+      await fsp.rename(tmp, target);
+    } catch (e) {
+      console.error('收藏写入失败:', e.message);
+    }
+  });
+  favSaveChain = job.catch(() => {});
+  return job;
+}
+
+function buildFavoritesData() {
+  const bases = [...favoritesMap.keys()];
+  const fileList = [];
+  const exts = {};
+  const kinds = {};
+  const groupRels = new Map(); // base -> rel[]
+  let bytes = 0;
+
+  if (favoritesMap.size) {
+    for (const folder of state.folders) {
+      for (const entry of folder.fileList) {
+        const [rel, size] = entry;
+        const base = baseOfRel(rel);
+        if (!favoritesMap.has(base)) continue;
+        fileList.push(entry);
+        bytes += size;
+        const ext = extOf(rel);
+        const kind = kindOf(rel);
+        const ex = (exts[ext] ||= { n: 0, b: 0 });
+        ex.n++; ex.b += size;
+        const kd = (kinds[kind] ||= { n: 0, b: 0 });
+        kd.n++; kd.b += size;
+        let arr = groupRels.get(base);
+        if (!arr) { arr = []; groupRels.set(base, arr); }
+        arr.push(rel);
+      }
+    }
+  }
+
+  // 封面：按最新收藏时间优先挑选一张有效照片/视频
+  let cover = null;
+  let coverKind = null;
+  const matchedBases = [...groupRels.keys()].sort((a, b) => (favoritesMap.get(b) || 0) - (favoritesMap.get(a) || 0));
+  for (const b of matchedBases) {
+    const rels = groupRels.get(b);
+    const picked =
+      rels.find((r) => kindOf(r) === 'jpg') ||
+      rels.find((r) => kindOf(r) === 'heif') ||
+      rels.find((r) => kindOf(r) === 'raw') ||
+      rels.find((r) => kindOf(r) === 'video');
+    if (picked) {
+      cover = picked;
+      coverKind = kindOf(picked);
+      break;
+    }
+  }
+
+  const addedAt = {};
+  for (const b of matchedBases) addedAt[b] = favoritesMap.get(b) || 0;
+
+  return {
+    count: groupRels.size,
+    files: fileList.length,
+    bytes,
+    exts,
+    kinds,
+    cover,
+    coverKind,
+    fileList,
+    bases,
+    addedAt,
+  };
+}
+
+function getFavoritesSummary() {
+  const d = buildFavoritesData();
+  return {
+    count: d.count,
+    files: d.files,
+    bytes: d.bytes,
+    cover: d.cover,
+    coverKind: d.coverKind,
+    bases: d.bases,
+  };
+}
+
+function pruneDeletedFavorites(relSet) {
+  if (!favoritesMap.size || !relSet || !relSet.size) return;
+  const affected = new Set();
+  for (const r of relSet) {
+    const b = baseOfRel(r);
+    if (favoritesMap.has(b)) affected.add(b);
+  }
+  if (!affected.size) return;
+  // 若同组仍有剩余文件（如 RAW+JPG 仅删其一），保留收藏；整组删空才清理
+  const stillAlive = new Set();
+  for (const folder of state.folders) {
+    for (const [r] of folder.fileList) {
+      const b = baseOfRel(r);
+      if (affected.has(b)) stillAlive.add(b);
+    }
+  }
+  const removed = [];
+  for (const b of affected) {
+    if (!stillAlive.has(b)) {
+      favoritesMap.delete(b);
+      removed.push(b);
+    }
+  }
+  if (removed.length) {
+    logOp('收藏', `随删除同步清理 (${removed.length} 项): ${removed.join(', ')}`);
+    return saveFavorites(ROOT);
+  }
+  return Promise.resolve();
+}
 
 function rememberRoot(dir) {
   const abs = path.resolve(dir);
@@ -207,49 +458,6 @@ function pickNativeFolder() {
   });
 }
 
-/** 把文件移入系统废纸篓 / 回收站（不永久删除） */
-function moveToTrash(absList) {
-  return new Promise((resolve, reject) => {
-    if (!absList.length) return resolve();
-    let cmd, args, env = process.env;
-    if (IS_MAC) {
-      if (fs.existsSync('/usr/bin/trash')) {
-        cmd = '/usr/bin/trash';
-        args = absList;
-      } else {
-        cmd = 'osascript';
-        args = [
-          '-e', 'on run argv',
-          '-e', 'repeat with p in argv',
-          '-e', 'set f to POSIX file (p as text) as alias',
-          '-e', 'tell application "Finder" to delete f',
-          '-e', 'end repeat',
-          '-e', 'end run',
-          '--', ...absList,
-        ];
-      }
-    } else if (IS_WIN) {
-      cmd = 'powershell';
-      args = [
-        '-NoProfile', '-Command',
-        "Add-Type -AssemblyName Microsoft.VisualBasic; $files = $env:TRASH_FILES | ConvertFrom-Json; foreach ($f in $files) { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($f, 'OnlyErrorDialogs', 'SendToRecycleBin') }",
-      ];
-      env = { ...process.env, TRASH_FILES: JSON.stringify(absList) };
-    } else {
-      cmd = 'gio';
-      args = ['trash', ...absList];
-    }
-    const p = spawn(cmd, args, { windowsHide: true, env, stdio: ['ignore', 'ignore', 'pipe'] });
-    let err = '';
-    p.stderr.on('data', (d) => { err += d.toString(); });
-    p.on('error', (e) => reject(new Error(`无法移入废纸篓: ${e.message}`)));
-    p.on('close', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(err.trim() || `移入废纸篓失败 (exit ${code})`));
-    });
-  });
-}
-
 function removeFilesFromState(relSet) {
   let changed = false;
   const keptFolders = [];
@@ -309,6 +517,7 @@ function removeFilesFromState(relSet) {
     state.folders = keptFolders;
     saveCache(ROOT, state.folders, state.elapsedMs);
   }
+  return pruneDeletedFavorites(relSet);
 }
 
 // ---------------------------------------------------------------- 状态
@@ -549,15 +758,48 @@ let sharpLib = null;
 try {
   sharpLib = require('sharp');
   sharpLib.concurrency(Math.max(1, Math.round(CORES / 2)));
-  sharpLib.cache({ memory: 64 });
+  // Windows 下必须设 files: 0，避免 libvips 缓存文件句柄导致删除原图时报占用（0x80270027）
+  sharpLib.cache({ memory: 64, files: IS_WIN ? 0 : 20 });
 } catch { sharpLib = null; }
 
 async function sharpThumb(input, maxPx) {
-  return sharpLib(input)
+  // Windows 下若传文件路径，先读进 Buffer 再交给 sharp，彻底杜绝任何 OS 文件句柄残留
+  const src = (IS_WIN && typeof input === 'string') ? await fsp.readFile(input) : input;
+  return sharpLib(src)
     .rotate()                                   // 按 EXIF 方向摆正（ffmpeg 对 JPEG 不做这个）
     .resize({ width: maxPx, height: maxPx, fit: 'inside', withoutEnlargement: true })
     .jpeg({ quality: 82 })
     .toBuffer();
+}
+
+// 追踪 serveFile 打开的活跃文件读取流，删除文件前立刻释放，防止 Windows 报文件占用
+const activeReadStreams = new Map();
+const streamKeyOf = (p) => (IS_WIN ? path.resolve(p).toLowerCase() : path.resolve(p));
+function trackReadStream(abs, stream) {
+  const k = streamKeyOf(abs);
+  let set = activeReadStreams.get(k);
+  if (!set) { set = new Set(); activeReadStreams.set(k, set); }
+  set.add(stream);
+  const cleanup = () => {
+    const s = activeReadStreams.get(k);
+    if (s) { s.delete(stream); if (!s.size) activeReadStreams.delete(k); }
+  };
+  stream.once('close', cleanup);
+  stream.once('error', cleanup);
+  return stream;
+}
+function releaseFileHandles(absList) {
+  for (const abs of absList) {
+    const k = streamKeyOf(abs);
+    const set = activeReadStreams.get(k);
+    if (set) {
+      for (const s of [...set]) { try { s.destroy(); } catch {} }
+      activeReadStreams.delete(k);
+    }
+  }
+  if (IS_WIN && sharpLib) {
+    try { sharpLib.cache(false); sharpLib.cache({ memory: 64, files: 0 }); } catch {}
+  }
 }
 
 // ---- 缩略图生成“暂停”开关：播放视频时前端会调，避免抢 CPU/GPU 导致卡顿
@@ -579,233 +821,35 @@ function resumePreviews() {
   pauseTimer = null;
 }
 
-let rawDevBuildPromise = null;
-async function ensureMacRawDevBin() {
-  if (!IS_MAC) return null;
-  if (!fs.existsSync(RAWDEV_SRC)) return null;
-  try {
-    const [srcSt, binSt] = await Promise.all([fsp.stat(RAWDEV_SRC), fsp.stat(RAWDEV_BIN).catch(() => null)]);
-    if (binSt && binSt.mtimeMs >= srcSt.mtimeMs) return RAWDEV_BIN;
-  } catch { return null; }
-  if (rawDevBuildPromise) return rawDevBuildPromise;
-  rawDevBuildPromise = (async () => {
-    try {
-      await fsp.mkdir(CACHE_DIR, { recursive: true });
-      await new Promise((resolve, reject) => {
-        let err = '';
-        const p = spawn('swiftc', ['-O', RAWDEV_SRC, '-o', RAWDEV_BIN], { stdio: ['ignore', 'ignore', 'pipe'] });
-        p.stderr.on('data', (d) => { err += d.toString(); });
-        p.on('error', reject);
-        p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(err.slice(-200) || `swiftc exit ${code}`))));
-      });
-      return RAWDEV_BIN;
-    } catch (e) {
-      console.error('  rawdev.swift 编译失败（将回退 dcraw_emu）:', e.message);
-      return null;
-    } finally {
-      rawDevBuildPromise = null;
-    }
-  })();
-  return rawDevBuildPromise;
-}
+// RAW 显影模块（macOS 原生 CIRAWFilter + Windows/兜底 LibRaw 16-bit 线性显影与机内 Tone Curve）
+const {
+  makeRawDevPreview,
+  clearRawLinearCache,
+  invalidateRawLinearFile,
+} = createRawDev({
+  IS_MAC,
+  CACHE_DIR,
+  PREV_DIR,
+  DCRAW_EMU,
+  RAWDEV_SRC,
+  RAWDEV_BIN,
+  sha1,
+  kindOf,
+  sharpLib,
+  activeChildren,
+  gateRawDev,
+  getRawBigCache,
+  extractEmbeddedJpeg,
+  ffmpegScaleBuffer,
+  logOp,
+});
 
-function runRawDevMac(bin, absFile, outFile, ev, maxPx, shadow = 0, highlight = 0, clipPpmPath = '', timeoutMs = 45000, signal = null) {
-  return new Promise((resolve, reject) => {
-    let stderr = '';
-    const args = [absFile, outFile, String(ev), String(maxPx), String(shadow), String(highlight)];
-    if (clipPpmPath) args.push(clipPpmPath);
-    const p = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
-    activeChildren.add(p);
-    const onAbort = () => { try { p.kill('SIGKILL'); } catch {} reject(new Error('aborted')); };
-    if (signal) {
-      if (signal.aborted) { try { p.kill('SIGKILL'); } catch {} return reject(new Error('aborted')); }
-      signal.addEventListener('abort', onAbort, { once: true });
-    }
-    const t = setTimeout(() => { try { p.kill(); } catch {} reject(new Error('rawdev timeout')); }, timeoutMs);
-    const done = () => { clearTimeout(t); activeChildren.delete(p); if (signal) signal.removeEventListener('abort', onAbort); };
-    p.stderr.on('data', (d) => { stderr += d.toString(); if (stderr.length > 4000) stderr = stderr.slice(-2000); });
-    p.on('error', (e) => { done(); reject(e); });
-    p.on('close', (code) => {
-      done();
-      code === 0 ? resolve() : reject(new Error(`rawdev exit ${code}: ${stderr.slice(-200)}`));
-    });
-  });
-}
-
-/**
- * 估算 dcraw 需要的提亮增益。
- * dcraw 的 -W（关自动提亮）输出比相机内嵌 JPEG 暗 1~2 档，直接给用户看太暗。
- * 做法：以「相机内嵌预览的平均亮度」为目标，除以「dcraw 中性渲染的平均亮度」，
- * 得到一个倍数乘到 -b 上。按文件缓存，同一张图只算一次。
- * 只在非 macOS 的 dcraw 兜底路径生效，不影响 macOS 的 CIRAWFilter。
- */
-const rawGainCache = new Map();
-async function estimateRawGain(absFile, signal = null) {
-  let st;
-  try { st = await fsp.stat(absFile); } catch { return 1; }
-  const key = sha1(`${absFile}|${st.size}|${Math.round(st.mtimeMs)}`);
-  if (rawGainCache.has(key)) return rawGainCache.get(key);
-
-  let target = 0;
-  const emb = await extractEmbeddedJpeg(absFile);
-  if (emb && sharpLib) {
-    try { target = (await sharpLib(emb).greyscale().stats()).channels[0].mean || 0; } catch {}
-  }
-
-  let base = 0;
-  try {
-    const tiff = await runDcrawEmu(absFile, 0, 0, 0, 45000, signal, 1);
-    if (sharpLib) base = (await sharpLib(tiff).greyscale().stats()).channels[0].mean || 0;
-  } catch {}
-
-  // dcraw 的 -b 乘在“线性”数据上，经过 sRGB gamma 后输出均值是次线性的：
-  // 实测 out ≈ base * b^0.61，所以反推 b = (target/base)^(1/0.61)
-  let gain = 1;
-  if (base > 3 && target > 8) {
-    gain = Math.pow(target / base, 1 / 0.61);
-    gain = Math.min(10, Math.max(1, gain));
-  }
-  if (process.env.RAWDEV_DEBUG) console.error(`  [gain] target=${target.toFixed(1)} base=${base.toFixed(1)} gain=${gain.toFixed(2)}`);
-  rawGainCache.set(key, gain);
-  return gain;
-}
-
-/** 导出物理传感器 16-bit 线性 PPM（无白平衡、无色彩矩阵、无色调曲线：65535=真饱和死白，0=真黑电平死黑） */
-function dumpSensorPpm16(absFile, outPpm, timeoutMs = 30000, signal = null) {
-  return new Promise((resolve, reject) => {
-    const args = ['-h', '-4', '-H', '0', '-r', '1', '1', '1', '1', '-o', '0', '-Z', '-', absFile];
-    const p = spawn(DCRAW_EMU, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    const ws = fs.createWriteStream(outPpm);
-    activeChildren.add(p);
-    let err = '';
-    const cleanup = () => { clearTimeout(t); activeChildren.delete(p); if (signal) signal.removeEventListener('abort', onAbort); };
-    const onAbort = () => { try { p.kill('SIGKILL'); } catch {} try { ws.destroy(); } catch {} reject(new Error('aborted')); };
-    if (signal) {
-      if (signal.aborted) { try { p.kill('SIGKILL'); } catch {} try { ws.destroy(); } catch {} return reject(new Error('aborted')); }
-      signal.addEventListener('abort', onAbort, { once: true });
-    }
-    const t = setTimeout(() => { try { p.kill(); } catch {} try { ws.destroy(); } catch {} reject(new Error('dcraw sensor timeout')); }, timeoutMs);
-    p.stdout.pipe(ws);
-    p.stderr.on('data', (d) => { err += d.toString(); if (err.length > 2000) err = err.slice(-1000); });
-    p.on('error', (e) => { cleanup(); try { ws.destroy(); } catch {} reject(e); });
-    ws.on('error', (e) => { cleanup(); try { p.kill('SIGKILL'); } catch {} reject(e); });
-    let exitCode = null, wsDone = false;
-    const maybeFinish = () => {
-      if (exitCode === null || !wsDone) return;
-      cleanup();
-      if (exitCode === 0) resolve(outPpm);
-      else reject(new Error(`dcraw sensor exit ${exitCode}: ${err.slice(-200)}`));
-    };
-    p.on('close', (code) => { exitCode = code; maybeFinish(); });
-    ws.on('finish', () => { wsDone = true; maybeFinish(); });
-  });
-}
-
-function runDcrawEmu(absFile, ev, shadow = 0, highlight = 0, timeoutMs = 45000, signal = null, gain = 1) {
-  return new Promise((resolve, reject) => {
-    const effEv = ev - highlight * 0.6;
-    // gain = 自动提亮倍数（估算自相机内嵌预览的亮度）
-    const mult = (Math.pow(2, effEv) * (gain || 1)).toFixed(3);
-    // -h 半尺寸 -w 相机白平衡 -W 禁用自动提亮 -H 5(高光重建)/2(柔和过渡) -o 1 sRGB -T TIFF 输出到 stdout
-    const args = ['-h', '-w', '-W', '-H', highlight > 0.001 ? '5' : '2', '-o', '1', '-b', mult];
-    if (shadow > 0.001) {
-      // 在 16-bit 线性转 sRGB gamma 时加大暗部斜率，提亮暗部同时保住高光
-      const gPow = (2.222 + shadow * 0.85).toFixed(3);
-      const gToe = (4.5 + shadow * 14).toFixed(2);
-      args.push('-g', gPow, gToe);
-    }
-    args.push('-T', '-Z', '-', absFile);
-    const p = spawn(DCRAW_EMU, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    activeChildren.add(p);
-    const chunks = [];
-    let err = '';
-    const onAbort = () => { try { p.kill('SIGKILL'); } catch {} reject(new Error('aborted')); };
-    if (signal) {
-      if (signal.aborted) { try { p.kill('SIGKILL'); } catch {} return reject(new Error('aborted')); }
-      signal.addEventListener('abort', onAbort, { once: true });
-    }
-    const t = setTimeout(() => { try { p.kill(); } catch {} reject(new Error('dcraw_emu timeout')); }, timeoutMs);
-    const done = () => { clearTimeout(t); activeChildren.delete(p); if (signal) signal.removeEventListener('abort', onAbort); };
-    p.stdout.on('data', (d) => chunks.push(d));
-    p.stderr.on('data', (d) => { err += d.toString(); if (err.length > 4000) err = err.slice(-2000); });
-    p.on('error', (e) => { done(); reject(e); });
-    p.on('close', (code) => {
-      done();
-      if (code === 0 && chunks.length) resolve(Buffer.concat(chunks));
-      else reject(new Error(`dcraw_emu exit ${code}: ${err.slice(-200)}`));
-    });
-  });
-}
-
-const rawDevJobs = new Map();
-/** RAW 曝光补偿 / 暗部提亮 / 高光压暗 / 线性溢出检测预览（ev: -4~+4, sh: 0~1, hl: 0~1, clip: 0|1） */
-async function makeRawDevPreview(absFile, rel, evRaw, shRaw = 0, hlRaw = 0, clipRaw = false, maxRaw = 2048, signal = null) {
-  if (kindOf(absFile) !== 'raw') return null;
-  let st;
-  try { st = await fsp.stat(absFile); } catch { return null; }
-  const ev = Math.max(-4, Math.min(4, Math.round(Number(evRaw) * 2) / 2 || 0));
-  const sh = Math.max(0, Math.min(1, Math.round(Number(shRaw) * 20) / 20 || 0));
-  const hl = Math.max(0, Math.min(1, Math.round(Number(hlRaw) * 20) / 20 || 0));
-  const clip = clipRaw === true || clipRaw === '1' || clipRaw === 1;
-  const rawMaxNum = Number(maxRaw);
-  const BIG_MAX = rawMaxNum === 0 ? 0 : Math.max(1024, Math.min(8192, Math.round(rawMaxNum || 2048)));
-  const key = sha1(`${rel}|${st.size}|${Math.round(st.mtimeMs)}|rawdev_v11|m${BIG_MAX}|ev${ev}|sh${sh}|hl${hl}|c${clip ? 1 : 0}`);
-  const out = path.join(PREV_DIR, `${key}-ev.jpg`);
-
-  try { await fsp.access(out); return { file: out, mime: 'image/jpeg' }; } catch {}
-  if (rawDevJobs.has(key)) return rawDevJobs.get(key);
-
-  const job = (async () => {
-    await fsp.mkdir(PREV_DIR, { recursive: true });
-    const tmp = out.replace(/\.jpg$/, '.part.jpg');
-
-    // 方案 B：macOS 原生 CIRAWFilter + CIHighlightShadowAdjust + 物理传感器 16-bit 溢出检测
-    if (IS_MAC) {
-      const bin = await ensureMacRawDevBin();
-      if (bin) {
-        const tmpPpm = clip ? out.replace(/\.jpg$/, '.part.ppm') : '';
-        try {
-          await gateRawDev(async () => {
-            if (tmpPpm) await dumpSensorPpm16(absFile, tmpPpm, 30000, signal);
-            await runRawDevMac(bin, absFile, tmp, ev, BIG_MAX, sh, hl, tmpPpm, 45000, signal);
-          }, signal);
-          await fsp.rename(tmp, out);
-          return { file: out, mime: 'image/jpeg' };
-        } catch (e) {
-          try { await fsp.unlink(tmp); } catch {}
-          if (signal && signal.aborted) throw e;
-          // 某些新机身系统不支持时静默回退到 dcraw_emu
-        } finally {
-          if (tmpPpm) try { await fsp.unlink(tmpPpm); } catch {}
-        }
-      }
-    }
-
-    // 方案 A 兜底：dcraw_emu（LibRaw）解码 TIFF -> sharp / ffmpeg 缩到 2048px JPEG
-    try {
-      const data = await gateRawDev(async () => {
-        const gain = await estimateRawGain(absFile, signal);
-        const tiff = await runDcrawEmu(absFile, ev, sh, hl, 45000, signal, gain);
-        if (signal && signal.aborted) throw new Error('aborted');
-        const fallbackMax = BIG_MAX || 4096;
-        if (sharpLib) {
-          return sharpThumb(tiff, fallbackMax).catch(() => ffmpegScaleBuffer(tiff, fallbackMax, signal));
-        }
-        return ffmpegScaleBuffer(tiff, fallbackMax, signal);
-      }, signal);
-      await fsp.writeFile(tmp, data);
-      await fsp.rename(tmp, out);
-      return { file: out, mime: 'image/jpeg' };
-    } catch (e) {
-      try { await fsp.unlink(tmp); } catch {}
-      if (signal && signal.aborted) throw e;
-      return null;
-    }
-  })().finally(() => rawDevJobs.delete(key));
-
-  rawDevJobs.set(key, job);
-  return job;
-}
+// 原生 1:1 像素级清晰度与空间合焦图服务
+const sharpnessSvc = createSharpnessService({
+  sharpLib,
+  kindOf,
+  extractEmbeddedJpeg,
+});
 
 function runSipsToJpeg(absFile, outFile, maxPx, timeoutMs = 30000, signal = null) {
   return new Promise((resolve, reject) => {
@@ -1423,6 +1467,9 @@ async function scanAll() {
   state.fromCache = false;
   state.finishedAt = Date.now();
   state.elapsedMs = state.finishedAt - state.startedAt;
+  const totalFiles = state.folders.reduce((a, f) => a + f.files, 0);
+  const totalBytes = state.folders.reduce((a, f) => a + f.bytes, 0);
+  logOp('扫描', `完成: ${state.folders.length} 个文件夹 / ${totalFiles} 个文件 (${fmtLogBytes(totalBytes)}, ${(state.elapsedMs / 1000).toFixed(2)}s)${state.errors.length ? ` · 异常 ${state.errors.length} 项` : ''}`);
   saveCache(scanRoot, state.folders, state.elapsedMs);
   trimPrevCache();
 }
@@ -1477,6 +1524,7 @@ async function switchRoot(newPath) {
   ROOT = abs;
   rememberRoot(abs);
   await saveConfig();
+  logOp('目录', `切换照片库 → ${ROOT}`);
 
   state.root = ROOT;
   state.status = 'idle';
@@ -1489,6 +1537,8 @@ async function switchRoot(newPath) {
   state.errors = [];
   state.error = null;
 
+  await loadFavorites(ROOT);
+  await loadAlbumNames(ROOT);
   const loaded = await loadCache(ROOT);
   setTimeout(scanAll, loaded ? 200 : 0);
   return { ok: true, root: ROOT, loaded };
@@ -1569,13 +1619,13 @@ async function serveFile(req, res, abs, { immutable = false, download = false } 
     headers['Content-Range'] = `bytes ${start}-${end}/${st.size}`;
     headers['Content-Length'] = end - start + 1;
     res.writeHead(206, headers);
-    return pipeStream(fs.createReadStream(abs, { start, end }));
+    return pipeStream(trackReadStream(abs, fs.createReadStream(abs, { start, end })));
   }
 
   headers['Content-Length'] = st.size;
   res.writeHead(200, headers);
   if (req.method === 'HEAD') return res.end();
-  pipeStream(fs.createReadStream(abs));
+  pipeStream(trackReadStream(abs, fs.createReadStream(abs)));
 }
 
 const PLACEHOLDER = (label) => Buffer.from(
@@ -1601,6 +1651,20 @@ async function handle(req, res) {
     });
     return res.end(html);
   }
+  if (p === '/styles.css' || p.startsWith('/js/')) {
+    const pubDir = path.join(__dirname, 'public');
+    const baseDir = p === '/styles.css' ? pubDir : path.join(pubDir, 'js');
+    const abs = path.resolve(pubDir, p.slice(1));
+    if (!abs.startsWith(baseDir + path.sep)) return send(res, 403, 'forbidden');
+    let buf;
+    try { buf = fs.readFileSync(abs); } catch { return send(res, 404, 'not found'); }
+    res.writeHead(200, {
+      'Content-Type': MIME[extOf(abs)] || 'application/octet-stream',
+      'Content-Length': buf.length,
+      'Cache-Control': 'no-cache, must-revalidate',
+    });
+    return res.end(buf);
+  }
   if (p === '/favicon.ico') return send(res, 204, '');
 
   // 扫描状态（前端轮询）
@@ -1616,8 +1680,9 @@ async function handle(req, res) {
       urls: lanUrls(),
       startedAt: state.startedAt, finishedAt: state.finishedAt, elapsedMs: state.elapsedMs,
       progress: state.progress, totals: t, errors: state.errors,
+      favorites: getFavoritesSummary(),
       folders: state.folders.map((f) => ({
-        name: f.name, rel: f.rel, bytes: f.bytes, files: f.files,
+        name: f.name, alias: albumNamesMap.get(f.rel) || '', rel: f.rel, bytes: f.bytes, files: f.files,
         exts: f.exts, kinds: f.kinds, subdirs: f.subdirs,
         tMin: f.tMin, tMax: f.tMax, cover: f.cover, coverKind: f.coverKind, exif: f.exif,
       })),
@@ -1678,9 +1743,73 @@ async function handle(req, res) {
     const f = state.folders.find((x) => x.rel === rel);
     if (!f) return sendJson(res, { error: 'not found' }, req);
     return sendJson(res, {
-      name: f.name, rel: f.rel, bytes: f.bytes, files: f.files, exts: f.exts,
+      name: f.name, alias: albumNamesMap.get(f.rel) || '', rel: f.rel, bytes: f.bytes, files: f.files, exts: f.exts,
       kinds: f.kinds, subdirs: f.subdirs, exif: f.exif, fileList: f.fileList,
     }, req);
+  }
+
+  // 设置 / 清除相册自定义名称（不影响磁盘上的文件夹原名，持久化到 cache/albums-<hash>.json）
+  if (p === '/api/folder/alias' && req.method === 'POST') {
+    if (!ROOT) return sendJson(res, { ok: false, error: '未设置照片库目录' }, req);
+    try {
+      const body = await readJsonBody(req);
+      const targetRel = typeof body.rel === 'string' ? body.rel : '';
+      if (!isValidFolderRel(targetRel)) return sendJson(res, { ok: false, error: '非法文件夹标识' }, req);
+      const existsInState = state.folders.some((x) => x.rel === targetRel);
+      if (!existsInState) {
+        const abs = resolveRel(targetRel);
+        let isDir = false;
+        try { isDir = !!(abs && (await fsp.stat(abs)).isDirectory()); } catch {}
+        if (!isDir) return sendJson(res, { ok: false, error: '文件夹不存在' }, req);
+      }
+      const alias = sanitizeAlbumAlias(body.alias);
+      if (alias) albumNamesMap.set(targetRel, alias);
+      else albumNamesMap.delete(targetRel);
+      await saveAlbumNames(ROOT);
+      logOp('相册名', `${targetRel} -> ${alias || '(已清除)'}`);
+      return sendJson(res, { ok: true, rel: targetRel, alias }, req);
+    } catch (e) {
+      return sendJson(res, { ok: false, error: String((e && e.message) || e) }, req);
+    }
+  }
+
+  // 收藏相册虚拟文件夹
+  if (p === '/api/favorites' && req.method === 'GET') {
+    const d = buildFavoritesData();
+    return sendJson(res, {
+      name: '收藏相册',
+      rel: '__favorites__',
+      isFavorites: true,
+      count: d.count,
+      files: d.files,
+      bytes: d.bytes,
+      exts: d.exts,
+      kinds: d.kinds,
+      subdirs: [],
+      cover: d.cover,
+      coverKind: d.coverKind,
+      fileList: d.fileList,
+      addedAt: d.addedAt,
+    }, req);
+  }
+
+  // 切换 / 设置单张照片收藏状态（按照片组 base 持久化到 cache/favorites-<hash>.json）
+  if (p === '/api/favorites/toggle' && req.method === 'POST') {
+    if (!ROOT) return sendJson(res, { ok: false, error: '未设置照片库目录' }, req);
+    try {
+      const body = await readJsonBody(req);
+      const rawBase = typeof body.base === 'string' ? body.base : (typeof body.rel === 'string' ? baseOfRel(body.rel) : '');
+      const base = rawBase.trim();
+      if (!isValidFavBase(base)) return sendJson(res, { ok: false, error: '非法照片标识' }, req);
+      const next = typeof body.favorite === 'boolean' ? body.favorite : !favoritesMap.has(base);
+      if (next) favoritesMap.set(base, Date.now());
+      else favoritesMap.delete(base);
+      await saveFavorites(ROOT);
+      logOp('收藏', `${next ? '+ ' : '- '}${base}`);
+      return sendJson(res, { ok: true, base, favorited: next, favorites: getFavoritesSummary() }, req);
+    } catch (e) {
+      return sendJson(res, { ok: false, error: String((e && e.message) || e) }, req);
+    }
   }
 
   if (p === '/api/media') {
@@ -1721,6 +1850,18 @@ async function handle(req, res) {
     return sendJson(res, { exif }, req, 'public, max-age=86400');
   }
 
+  // 原生 1:1 像素级清晰度与 8×6 空间合焦图（高清预览模式下避免缩图抹平模糊）
+  if (p === '/api/sharpness') {
+    const abs = resolveRel(rel);
+    if (!abs) return send(res, 400, 'bad path');
+    try {
+      const sharpRes = await sharpnessSvc.analyzeFile(abs);
+      return sendJson(res, { ok: !!sharpRes, sharpness: sharpRes }, req, 'public, max-age=86400');
+    } catch {
+      return sendJson(res, { ok: false, sharpness: null }, req);
+    }
+  }
+
   // 缩略图（最长边 640px，统一缓存）
   if (p === '/api/prev') {
     const abs = resolveRel(rel);
@@ -1755,12 +1896,13 @@ async function handle(req, res) {
     const sh = Number(url.searchParams.get('sh') || 0);
     const hl = Number(url.searchParams.get('hl') || 0);
     const clip = url.searchParams.get('clip') === '1';
+    const noisePct = url.searchParams.has('np') ? Number(url.searchParams.get('np')) : 0.3;
     const maxParam = url.searchParams.get('max');
     const maxPx = maxParam === '0' ? 0 : Number(maxParam || 2048);
     const ac = new AbortController();
     res.on('close', () => { if (!res.writableEnded) ac.abort(); });
     try {
-      const r = await makeRawDevPreview(abs, rel, ev, sh, hl, clip, maxPx, ac.signal);
+      const r = await makeRawDevPreview(abs, rel, ev, sh, hl, clip, maxPx, ac.signal, noisePct);
       if (ac.signal.aborted) return;
       if (!r) return send(res, 422, 'raw develop failed');
       return serveFile(req, res, r.file, { immutable: false });
@@ -1827,27 +1969,56 @@ async function handle(req, res) {
         let st;
         try { st = await fsp.stat(abs); } catch { continue; }
         if (!st.isFile()) return sendJson(res, { ok: false, error: `只能删除文件：${r}` }, req);
-        targets.push({ rel: r, abs });
+        targets.push({ rel: r, abs, size: st.size });
       }
       if (!targets.length) return sendJson(res, { ok: false, error: '文件已不存在' }, req);
-      await moveToTrash(targets.map((t) => t.abs));
-      const deletedSet = new Set(targets.map((t) => t.rel));
-      removeFilesFromState(deletedSet);
+      releaseFileHandles(targets.map((t) => t.abs));
+      let trashErr = null;
+      try {
+        await moveToTrash(targets.map((t) => t.abs));
+      } catch (e) {
+        trashErr = e;
+      }
+      // 核实磁盘上哪些文件确实已移入回收站（即使批量删除部分失败，也要把已删项同步清理出状态）
+      const gone = [];
+      const stillThere = [];
       for (const t of targets) {
-        for (const k of exifCache.keys()) if (k.startsWith(t.abs + '|')) exifCache.delete(k);
-        for (const k of rawBigCache.keys()) if (k.startsWith(t.abs + '|')) {
-          rawBigCacheBytes -= rawBigCache.get(k).length;
-          rawBigCache.delete(k);
+        let exists = true;
+        try { await fsp.access(t.abs); } catch { exists = false; }
+        if (exists) stillThere.push(t);
+        else gone.push(t);
+      }
+      if (gone.length) {
+        const deletedBytes = gone.reduce((a, t) => a + (t.size || 0), 0);
+        logOp('删除', `已移入回收站 (${gone.length} 个, ${fmtLogBytes(deletedBytes)}): ${gone.map((t) => t.rel).join(', ')}`);
+        await removeFilesFromState(new Set(gone.map((t) => t.rel)));
+        for (const t of gone) {
+          for (const k of exifCache.keys()) if (k.startsWith(t.abs + '|')) exifCache.delete(k);
+          for (const k of rawBigCache.keys()) if (k.startsWith(t.abs + '|')) {
+            rawBigCacheBytes -= rawBigCache.get(k).length;
+            rawBigCache.delete(k);
+          }
+          invalidateRawLinearFile(t.abs);
+          sharpnessSvc.invalidateFile(t.abs);
         }
       }
-      return sendJson(res, { ok: true, deleted: targets.map((t) => t.rel) }, req);
+      if (stillThere.length || trashErr) {
+        const errMsg = String((trashErr && trashErr.message) || trashErr || '部分文件未能移入回收站');
+        logOp('删除失败', `${(stillThere.length ? stillThere : targets).map((t) => t.rel).join(', ')} -> ${errMsg}`, true);
+        return sendJson(res, { ok: false, error: errMsg, deleted: gone.map((t) => t.rel) }, req);
+      }
+      return sendJson(res, { ok: true, deleted: gone.map((t) => t.rel) }, req);
     } catch (e) {
+      logOp('删除失败', String((e && e.message) || e), true);
       return sendJson(res, { ok: false, error: String((e && e.message) || e) }, req);
     }
   }
 
   if (p === '/api/rescan') {
-    if (state.status !== 'scanning') setTimeout(scanAll, 50);
+    if (state.status !== 'scanning') {
+      logOp('扫描', `手动触发重新扫描: ${ROOT}`);
+      setTimeout(scanAll, 50);
+    }
     return sendJson(res, { ok: true }, req);
   }
 
@@ -1862,6 +2033,9 @@ async function handle(req, res) {
 
   if (p === '/api/cache/clear') {
     try { await fsp.rm(PREV_DIR, { recursive: true, force: true }); } catch {}
+    clearRawLinearCache();
+    rawBigCache.clear(); rawBigCacheBytes = 0;
+    logOp('缓存', '已清空缩略图与 RAW 显影缓存');
     return sendJson(res, { ok: true }, req);
   }
 
@@ -1889,8 +2063,8 @@ async function handle(req, res) {
 // ---------------------------------------------------------------- 启动
 (async () => {
   try { await fsp.mkdir(CACHE_DIR, { recursive: true }); } catch {}
-  try { await fsp.writeFile(path.join(CACHE_DIR, 'server.pid'), String(process.pid)); } catch {}
-  try { await fsp.writeFile(path.join(CACHE_DIR, 'port.txt'), String(PORT)); } catch {}
+  await loadFavorites(ROOT);
+  await loadAlbumNames(ROOT);
   const loaded = await loadCache(ROOT);
 
   const server = http.createServer((req, res) => {
@@ -1899,7 +2073,20 @@ async function handle(req, res) {
       try { send(res, 500, 'server error: ' + e.message); } catch {}
     });
   });
+  const pidFile = path.join(CACHE_DIR, 'server.pid');
+  const cleanupPid = () => {
+    try {
+      if (fs.readFileSync(pidFile, 'utf8').trim() === String(process.pid)) fs.unlinkSync(pidFile);
+    } catch {}
+  };
   server.listen(PORT, HOST, () => {
+    // 监听成功后再写入 server.pid，避免重复启动遇 EADDRINUSE 时覆盖掉正在运行的老进程 PID
+    try { fs.writeFileSync(pidFile, String(process.pid)); } catch {}
+    try { fs.writeFileSync(path.join(CACHE_DIR, 'port.txt'), String(PORT)); } catch {}
+    process.once('exit', cleanupPid);
+    process.once('SIGINT', () => { cleanupPid(); process.exit(0); });
+    process.once('SIGTERM', () => { cleanupPid(); process.exit(0); });
+
     console.log(`\n  照片库总览  →  http://localhost:${PORT}`);
     const lan = lanUrls();
     if (HOST === '0.0.0.0' && lan.length) {
@@ -1914,8 +2101,9 @@ async function handle(req, res) {
     console.log('  按 Ctrl+C 停止\n');
     if (ROOT) setTimeout(scanAll, loaded ? 400 : 0);
     setTimeout(trimPrevCache, 3000);
-    // 预热 ffmpeg：避免第一次生成缩略图时还要等杀软扫描进程（否则首次会多 1-2 秒）
+    // 预热 ffmpeg 与 Windows 原生回收站二进制：避免第一次用时卡顿
     try { spawn(FFMPEG, ['-version'], { stdio: 'ignore', windowsHide: true }).unref(); } catch {}
+    if (IS_WIN) ensureWinTrashBin().catch(() => {});
   });
   server.on('error', (e) => {
     if (e.code === 'EADDRINUSE') console.error(`端口 ${PORT} 已被占用，可设置 PORT=其他端口 再启动`);

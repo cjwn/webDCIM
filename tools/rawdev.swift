@@ -12,9 +12,10 @@ let inURL = URL(fileURLWithPath: args[1])
 let outURL = URL(fileURLWithPath: args[2])
 let ev = Float(args[3]) ?? 0.0
 let maxPx = Double(args.count >= 5 ? (Double(args[4]) ?? 2048.0) : 2048.0) // <=0 表示原生满分辨率
-let shadow = max(0.0, min(1.0, Double(args.count >= 6 ? (Double(args[5]) ?? 0.0) : 0.0)))
-let highlight = max(0.0, min(1.0, Double(args.count >= 7 ? (Double(args[6]) ?? 0.0) : 0.0)))
+let shadow = max(0.0, min(2.0, Double(args.count >= 6 ? (Double(args[5]) ?? 0.0) : 0.0)))
+let highlight = max(0.0, min(2.0, Double(args.count >= 7 ? (Double(args[6]) ?? 0.0) : 0.0)))
 let clipPpmPath = (args.count >= 8 && !args[7].isEmpty && args[7] != "0") ? args[7] : nil
+let noisePct = max(0.0, min(5.0, Double(args.count >= 9 ? (Double(args[8]) ?? 0.3) : 0.3)))
 
 guard let filter = CIRAWFilter(imageURL: inURL) else {
     fputs("CIRAWFilter failed to open input\n", stderr)
@@ -50,13 +51,19 @@ if scale < 0.999, let lan = CIFilter(name: "CILanczosScaleTransform") {
     }
 }
 
-if (shadow > 0.001 || highlight > 0.001), let hs = CIFilter(name: "CIHighlightShadowAdjust") {
+var remSh = shadow
+var remHl = highlight
+while (remSh > 0.001 || remHl > 0.001), let hs = CIFilter(name: "CIHighlightShadowAdjust") {
+    let stepSh = min(1.0, remSh)
+    let stepHl = min(1.0, remHl)
     hs.setValue(image, forKey: kCIInputImageKey)
-    hs.setValue(shadow, forKey: "inputShadowAmount")
-    hs.setValue(1.0 - highlight, forKey: "inputHighlightAmount")
+    hs.setValue(stepSh, forKey: "inputShadowAmount")
+    hs.setValue(1.0 - stepHl, forKey: "inputHighlightAmount")
     if let adjusted = hs.outputImage {
         image = adjusted
     }
+    remSh = max(0.0, remSh - stepSh)
+    remHl = max(0.0, remHl - stepHl)
 }
 
 if let sharp = CIFilter(name: "CISharpenLuminance") {
@@ -123,7 +130,8 @@ if let ppmPath = clipPpmPath, let ppmData = try? Data(contentsOf: URL(fileURLWit
         let rh = ppm.h
         let baseOff = ppm.offset
         let hiThresh: UInt16 = 64800 // 物理传感器三通道全部 >= 98.9% 饱和（彻底死白）
-        let loThresh: UInt16 = 12    // 物理传感器三通道全部 <= 0.018% 黑电平（彻底死黑）
+        let loThresh: UInt16 = 12    // 物理传感器三通道全部 <= 0.018% 黑电平（硬件归零死黑）
+        let noiseThresh: UInt16 = noisePct > 0.0 ? UInt16(min(65535, Int(round(65535.0 * noisePct / 100.0)))) : 0
 
         ppmData.withUnsafeBytes { rawPtr in
             let p = rawPtr.bindMemory(to: UInt8.self)
@@ -145,8 +153,13 @@ if let ppmPath = clipPpmPath, let ppmData = try? Data(contentsOf: URL(fileURLWit
                         outBuf[o + 3] = 255
                     } else if r <= loThresh && g <= loThresh && b <= loThresh {
                         outBuf[o] = UInt8(Int(outBuf[o]) / 5)
-                        outBuf[o + 1] = UInt8(min(255, Int(outBuf[o + 1]) / 3 + 70))
+                        outBuf[o + 1] = UInt8(min(255, Int(outBuf[o + 1]) / 4 + 35))
                         outBuf[o + 2] = 255
+                        outBuf[o + 3] = 255
+                    } else if noiseThresh > loThresh && r <= noiseThresh && g <= noiseThresh && b <= noiseThresh {
+                        outBuf[o] = UInt8(min(255, Int(Double(outBuf[o]) * 0.45) + 64))
+                        outBuf[o + 1] = UInt8(min(255, Int(Double(outBuf[o + 1]) * 0.45) + 122))
+                        outBuf[o + 2] = UInt8(min(255, Int(Double(outBuf[o + 2]) * 0.45) + 142))
                         outBuf[o + 3] = 255
                     }
                 }

@@ -6,3 +6,6 @@ _backup/
 # LibRaw 二进制（自行下载放入 tools/libraw/）
 tools/libraw/*.exe
 tools/libraw/*.dll
+
+# 本机编译的原生托盘程序（运行 tools/build-tray.bat 即可重新生成）
+OUTPUTWebViewer.exe
