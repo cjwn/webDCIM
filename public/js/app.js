@@ -207,6 +207,8 @@ function renderHeader() {
     else lanEl.style.display = 'none';
   }
   const showHdrActions = !!(STATE.root && STATE.status !== 'error');
+  const hdrSearch = $('#hdrSearch');
+  if (hdrSearch) hdrSearch.style.display = showHdrActions ? '' : 'none';
   const camBtn = $('#btnCamOnly');
   if (camBtn) {
     camBtn.style.display = showHdrActions ? '' : 'none';
@@ -248,8 +250,111 @@ function renderHeader() {
     $('#scanText').textContent = `正在扫描 ${p.done}/${p.total} 个文件夹… ${p.current || ''}（已发现 ${fmtSize(p.bytes)}）`;
     $('#tTime').textContent = '扫描中';
   } else {
-    $('#tTime').textContent = STATE.elapsedMs ? (STATE.elapsedMs / 1000).toFixed(1) + 's' : '';
+    $('#tTime').textContent = STATE.elapsedMs ? (STATE.elapsedMs / 1000).toFixed(1) + 's' : '–';
   }
+}
+
+// ---------------------------------------------------------------- 总览搜索（日期 / 文件夹名称 / 自定义相册名 / 相机）
+const pad2 = (n) => String(n).padStart(2, '0');
+function fmtTsDate(ms) {
+  if (!ms || !Number.isFinite(ms)) return '';
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return '';
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+function addDateVariants(set, y, m, d) {
+  const yy = String(y);
+  const mm = pad2(m);
+  const dd = pad2(d);
+  set.add(`${yy}-${mm}-${dd}`);
+  set.add(`${yy}${mm}${dd}`);
+  set.add(`${yy}年${Number(m)}月${Number(d)}日`);
+  set.add(`${yy}年${mm}月${dd}日`);
+}
+function extractFolderDates(f) {
+  const dates = new Set();
+  const addFromText = (txt) => {
+    if (!txt) return false;
+    let found = false;
+    const s = String(txt);
+    for (const m of s.matchAll(/\b((?:19|20)\d{2})[-./_](\d{1,2})[-./_](\d{1,2})\b/g)) {
+      const mo = +m[2], dy = +m[3];
+      if (mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) {
+        addDateVariants(dates, m[1], mo, dy);
+        found = true;
+      }
+    }
+    for (const m of s.matchAll(/(?:^|[^\d])((?:19|20)\d{2})(\d{2})(\d{2})(?:[^\d]|$)/g)) {
+      const mo = +m[2], dy = +m[3];
+      if (mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) {
+        addDateVariants(dates, m[1], mo, dy);
+        found = true;
+      }
+    }
+    if (!found) {
+      for (const m of s.matchAll(/\b((?:19|20)\d{2})[-./_](\d{1,2})\b/g)) {
+        const mo = +m[2];
+        if (mo >= 1 && mo <= 12) {
+          const mm = pad2(mo);
+          dates.add(`${m[1]}-${mm}`);
+          dates.add(`${m[1]}${mm}`);
+          dates.add(`${m[1]}年${mo}月`);
+          dates.add(`${m[1]}年${mm}月`);
+          found = true;
+        }
+      }
+    }
+    return found;
+  };
+  const hasNameDate = addFromText(f.name);
+  const sampDate = f && f.exif && f.exif.sample && f.exif.sample.date;
+  const hasExifDate = addFromText(sampDate);
+  if (!hasNameDate && !hasExifDate) {
+    if (f.tMin) addFromText(fmtTsDate(f.tMin));
+    if (f.tMax && f.tMax !== f.tMin) addFromText(fmtTsDate(f.tMax));
+  }
+  return [...dates].join(' ');
+}
+function normalizeDateQueryToken(tok) {
+  let m;
+  if ((m = /^((?:19|20)\d{2})(?:[-./]|年)(\d{1,2})(?:[-./]|月)(\d{1,2})[日号]?$/.exec(tok))) {
+    const mo = +m[2], dy = +m[3];
+    if (mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) return `${m[1]}-${pad2(mo)}-${pad2(dy)}`;
+  }
+  if ((m = /^((?:19|20)\d{2})(?:[-./]|年)(\d{1,2})月?$/.exec(tok))) {
+    const mo = +m[2];
+    if (mo >= 1 && mo <= 12) return `${m[1]}-${pad2(mo)}`;
+  }
+  if ((m = /^((?:19|20)\d{2})年$/.exec(tok))) {
+    return m[1];
+  }
+  if ((m = /^(\d{1,2})(?:[-./]|月)(\d{1,2})[日号]?$/.exec(tok))) {
+    const mo = +m[1], dy = +m[2];
+    if (mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) return `-${pad2(mo)}-${pad2(dy)}`;
+  }
+  if ((m = /^(\d{1,2})月$/.exec(tok))) {
+    const mo = +m[1];
+    if (mo >= 1 && mo <= 12) return `-${pad2(mo)}-`;
+  }
+  return '';
+}
+function parseSearchTokens(rawQ) {
+  return String(rawQ || '').trim().toLowerCase().split(/\s+/).filter(Boolean).map((raw) => ({
+    raw,
+    dateNorm: normalizeDateQueryToken(raw),
+  }));
+}
+function folderMatchesQuery(f, tokens) {
+  const cams = ((f.exif || {}).cameras || []).map((c) => c.name).join(' ');
+  const dateStr = extractFolderDates(f);
+  const hay = `${f.name || ''} ${f.alias || ''} ${cams} ${dateStr}`.toLowerCase();
+  const dateHay = dateStr.toLowerCase();
+  for (const { raw, dateNorm } of tokens) {
+    if (hay.includes(raw)) continue;
+    if (dateNorm && dateHay.includes(dateNorm)) continue;
+    return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------- 总览渲染
@@ -265,18 +370,25 @@ function folderKinds(f) {
 }
 
 function render() {
-  const q = ($('#q').value || '').trim().toLowerCase();
+  const rawQ = ($('#q').value || '').trim();
+  const tokens = parseSearchTokens(rawQ);
+  const hasQ = tokens.length > 0;
   let folders = STATE.folders.slice();
 
   if (cameraOnly) {
     folders = folders.filter(isCameraFolder);
   }
 
-  if (q) {
-    folders = folders.filter((f) => {
-      const cams = ((f.exif || {}).cameras || []).map((c) => c.name).join(' ');
-      return (f.name + ' ' + (f.alias || '') + ' ' + cams).toLowerCase().includes(q);
-    });
+  if (hasQ) {
+    folders = folders.filter((f) => folderMatchesQuery(f, tokens));
+  }
+
+  const hdrSearch = $('#hdrSearch');
+  if (hdrSearch) {
+    hdrSearch.classList.toggle('has-q', hasQ);
+    hdrSearch.classList.toggle('no-hit', hasQ && folders.length === 0);
+    const cntEl = $('#hdrSearchCount');
+    if (cntEl) cntEl.textContent = fmtNum(folders.length);
   }
 
   if (sortKey === 'size') folders.sort((a, b) => b.bytes - a.bytes);
@@ -304,7 +416,7 @@ function render() {
     const sum = list.reduce((a, f) => a + f.bytes, 0);
     const n = list.reduce((a, f) => a + f.files, 0);
     if (year) {
-      const coll = collapsedYears.has(year);
+      const coll = !hasQ && collapsedYears.has(year);
       html.push(`<section class="year ${coll ? 'collapsed' : ''}" data-year="${year}">
         <div class="year-h"><span class="chev">▼</span><h2>${year}</h2>
         <span class="sum">${list.length} 个文件夹 · ${fmtNum(n)} 个文件 · ${fmtSize(sum)}</span></div>
@@ -364,11 +476,19 @@ function render() {
       <button class="btn-primary" id="btnPickEmpty">📂 切换其他目录</button>
     </div>`);
   } else if (!folders.length) {
-    html.push(`<div class="empty">${STATE.status === 'scanning' ? '扫描中…' : '没有匹配的文件夹'}</div>`);
+    const emptyText = STATE.status === 'scanning'
+      ? '扫描中…'
+      : (hasQ
+        ? `没有匹配「${escHtml(rawQ)}」的文件夹` + (cameraOnly ? '（当前已开启「仅看相机」）' : '')
+        : '没有匹配的文件夹');
+    html.push(`<div class="empty">${emptyText}</div>`);
   }
   $('#overview').innerHTML = html.join('');
-  $('#hintText').textContent = `共 ${fmtNum(STATE.folders.length)} 个文件夹` +
-    (cameraOnly ? ` · 仅相机 ${fmtNum(folders.length)}` : (q ? ` · 匹配 ${folders.length}` : ''));
+  const hintParts = [`共 ${fmtNum(STATE.folders.length)} 个文件夹`];
+  if (cameraOnly && hasQ) hintParts.push('仅相机', `匹配 ${fmtNum(folders.length)}`);
+  else if (cameraOnly) hintParts.push(`仅相机 ${fmtNum(folders.length)}`);
+  else if (hasQ) hintParts.push(`匹配 ${fmtNum(folders.length)}`);
+  $('#hintText').textContent = hintParts.join(' · ');
 }
 
 // 事件委托：总览
@@ -401,9 +521,40 @@ $('#overview').addEventListener('click', (e) => {
 });
 
 let qTimer = null;
-$('#q').addEventListener('input', () => {
+const qInput = $('#q');
+function applySearchNow() {
   clearTimeout(qTimer);
-  qTimer = setTimeout(render, 120);
+  render();
+  if (window.scrollY > 0) window.scrollTo(0, 0);
+}
+qInput.addEventListener('input', () => {
+  clearTimeout(qTimer);
+  const hs = $('#hdrSearch');
+  if (hs) hs.classList.toggle('has-q', !!qInput.value.trim());
+  qTimer = setTimeout(() => {
+    render();
+    if (window.scrollY > 0) window.scrollTo(0, 0);
+  }, 100);
+});
+qInput.addEventListener('keydown', (e) => {
+  if (e.isComposing || e.keyCode === 229) return;
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    if (qInput.value) {
+      qInput.value = '';
+      applySearchNow();
+    } else {
+      qInput.blur();
+    }
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    applySearchNow();
+  }
+});
+$('#btnClearQ').addEventListener('click', () => {
+  qInput.value = '';
+  applySearchNow();
+  qInput.focus();
 });
 $('#lanUrl').addEventListener('click', async () => {
   const url = $('#lanUrl').dataset.url;

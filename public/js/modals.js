@@ -55,6 +55,8 @@ function afterRootSwitched(newRoot) {
   aliasPendingIntent.clear();
   favoriteAddedAt = {};
   favDirtyInDetail = false;
+  const qEl = $('#q');
+  if (qEl) qEl.value = '';
   if ($('#lb').classList.contains('show')) closeLightbox(false);
   if ($('#detail').classList.contains('show')) closeDetail(false);
   if (location.hash) history.replaceState(null, '', location.pathname + location.search);

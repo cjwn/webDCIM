@@ -15,6 +15,12 @@
     <span class="lan" id="lanUrl" style="display:none" title="点击复制，手机/别的电脑用这个地址"></span>
     <div class="hright">
       <div class="hdr-actions">
+        <div class="hdr-search" id="hdrSearch" style="display:none">
+          <span class="ico" aria-hidden="true">🔍</span>
+          <input type="text" id="q" placeholder="搜索日期 / 文件夹 / 相册名…" title="支持日期（如 2024-10、202410、10月29日）、文件夹名称、自定义相册名、相机型号，空格可组合多条件" autocomplete="off" spellcheck="false">
+          <span class="cnt mono" id="hdrSearchCount">0</span>
+          <button type="button" class="clr" id="btnClearQ" title="清空搜索（Esc）" aria-label="清空搜索">✕</button>
+        </div>
         <button type="button" class="hdr-btn" id="btnCamOnly" style="display:none" aria-pressed="false" title="仅显示相机拍摄的文件夹（过滤手机照片与纯视频）">
           <span class="ico" aria-hidden="true">📷</span>
           <span>仅看相机</span>
@@ -30,7 +36,7 @@
         <div class="stat"><b class="mono" id="tFolders">–</b><span>文件夹</span></div>
         <div class="stat"><b class="mono" id="tFiles">–</b><span>文件</span></div>
         <div class="stat"><b class="mono" id="tSize">–</b><span>总大小</span></div>
-        <div class="stat"><b class="mono" id="tTime">–</b><span>&nbsp;</span></div>
+        <div class="stat" title="上次扫描照片库耗时"><b class="mono" id="tTime">–</b><span>扫描耗时</span></div>
       </div>
     </div>
   </div>
@@ -39,7 +45,6 @@
 </header>
 
 <div class="toolbar">
-  <input type="search" id="q" placeholder="搜索文件夹 / 相册名 / 年份 / 相机…">
   <div class="seg" id="sortSeg">
     <button data-sort="date" class="active">日期 ↓</button>
     <button data-sort="dateUp">日期 ↑</button>
